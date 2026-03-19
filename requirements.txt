@@ -1,3 +1,0 @@
-chardet>=5.0.0
-pandas>=1.5.0
-openpyxl>=3.0.0  # 用于处理 Excel 文件（如果 CSV 中有特殊格式）

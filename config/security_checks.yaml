@@ -1,0 +1,195 @@
+# OpenClaw 安全加固审计规则库
+# 版本: 2026-03-19 (适配最新威胁情报)
+
+metadata:
+  last_updated: "2026-03-19"
+  threat_model_version: "2026-Q1"
+  reference:
+    - "https://github.com/OpenClaw/Security-Guide"
+    - "https://slowmist.medium.com/openclaw-security-practice"
+
+# 高危 CVE 数据库
+cve_database:
+  CVE-2026-25253:
+    cvss: 8.8
+    severity: critical
+    description: "WebSocket 远程代码执行"
+    affected_versions: "<2026.1.29"
+    fix_version: "2026.1.29"
+    check_command: "version"
+    remediation: "立即升级到 2026.1.29 或更高版本"
+    
+  CVE-2026-24763:
+    cvss: 7.8
+    severity: high
+    description: "Docker 沙箱命令注入"
+    affected_versions: "<2026.1.29"
+    fix_version: "2026.1.29"
+    check_type: "docker_config"
+    remediation: "升级版本并检查 docker-compose 中的 PATH 变量处理"
+    
+  CVE-2026-25157:
+    cvss: 7.5
+    severity: high
+    description: "SSH 模式命令注入"
+    affected_versions: "<2026.1.29"
+    fix_version: "2026.1.29"
+    check_type: "ssh_mode"
+    remediation: "禁用 SSH 模式或升级到安全版本"
+    
+  CVE-2026-25593:
+    cvss: 6.5
+    severity: medium
+    description: "ClawJacked Gateway 暴力破解"
+    affected_versions: "<2026.2.26"
+    fix_version: "2026.2.26"
+    check_type: "gateway_binding"
+    remediation: "绑定 Gateway 到 127.0.0.1 并升级版本"
+
+# 七层安全基线检查规则
+baseline_checks:
+  layer1_gateway:
+    name: "网关绑定安全"
+    checks:
+      - id: GW-001
+        name: "Gateway 绑定 Loopback"
+        severity: critical
+        check: "gateway.bind == '127.0.0.1' || gateway.bind == 'localhost'"
+        fail_message: "Gateway 暴露在非回环地址，存在 ClawJacked 攻击风险"
+        
+      - id: GW-002
+        name: "WebSocket 跨域限制"
+        severity: high
+        check: "gateway.cors_origins != '*'"
+        fail_message: "WebSocket 允许任意跨域来源"
+        
+  layer2_auth:
+    name: "认证与授权"
+    checks:
+      - id: AUTH-001
+        name: "Token 认证启用"
+        severity: critical
+        check: "auth.mode == 'token'"
+        fail_message: "未启用 Token 认证，允许匿名访问"
+        
+      - id: AUTH-002
+        name: "Token 强度"
+        severity: high
+        check: "len(auth.token) >= 32"
+        fail_message: "Token 长度不足 32 字符，易被暴力破解"
+        
+      - id: AUTH-003
+        name: "禁用 None 认证"
+        severity: critical
+        check: "auth.mode != 'none'"
+        fail_message: "允许 'none' 认证模式，严重安全风险"
+        
+  layer3_network:
+    name: "网络防火墙"
+    checks:
+      - id: NET-001
+        name: "云元数据保护"
+        severity: high
+        check: "iptables -L | grep 169.254.169.254 | grep DROP"
+        fail_message: "未阻断云元数据访问 (169.254.169.254)，存在凭证窃取风险"
+        
+      - id: NET-002
+        name: "默认拒绝策略"
+        severity: medium
+        check: "iptables -L INPUT | grep DROP"
+        fail_message: "防火墙未配置默认拒绝入站规则"
+        
+  layer4_container:
+    name: "容器隔离"
+    checks:
+      - id: CONT-001
+        name: "非 Root 用户"
+        severity: high
+        check: "docker_config.User != '' && docker_config.User != 'root'"
+        fail_message: "容器以 root 用户运行"
+        
+      - id: CONT-002
+        name: "特权提升限制"
+        severity: high
+        check: "'no-new-privileges:true' in docker_config.SecurityOpt"
+        fail_message: "未禁用特权提升 (no-new-privileges)"
+        
+      - id: CONT-003
+        name: "Capabilities 限制"
+        severity: medium
+        check: "'ALL' in docker_config.CapDrop"
+        fail_message: "未丢弃所有 Capabilities"
+        
+      - id: CONT-004
+        name: "资源限制"
+        severity: medium
+        check: "docker_config.Memory != 0 && docker_config.CpuQuota != 0"
+        fail_message: "未设置内存/CPU 资源限制，存在 DoS 风险"
+        
+  layer5_runtime:
+    name: "运行时防护"
+    checks:
+      - id: RUN-001
+        name: "沙箱模式启用"
+        severity: critical
+        check: "sandbox.enabled == true"
+        fail_message: "未启用沙箱模式，代码可在宿主机执行"
+        
+      - id: RUN-002
+        name: "工具白名单"
+        severity: high
+        check: "len(tools.allow) > 0 || len(tools.deny) > 0"
+        fail_message: "未配置 tools.allow/deny 列表，所有工具可用"
+        
+      - id: RUN-003
+        name: "操作审批"
+        severity: medium
+        check: "requireApproval == true"
+        fail_message: "未启用高危操作人工审批"
+        
+  layer6_credential:
+    name: "凭据管理"
+    checks:
+      - id: CREDS-001
+        name: "环境变量存储"
+        severity: high
+        check: "!contains(config_content, 'api_key:') && !contains(config_content, 'secret:')"
+        fail_message: "配置文件中硬编码 API 密钥"
+        
+      - id: CREDS-002
+        name: "文件权限"
+        severity: medium
+        check: "file_perm('.env') == '600'"
+        fail_message: ".env 文件权限过于宽松，应设为 600"
+        
+  layer7_monitoring:
+    name: "监控审计"
+    checks:
+      - id: MON-001
+        name: "操作日志"
+        severity: medium
+        check: "logging.level == 'debug' || logging.audit == true"
+        fail_message: "未启用详细操作日志，无法追溯安全事件"
+        
+      - id: MON-002
+        name: "健康检查"
+        severity: low
+        check: "health_check.enabled == true"
+        fail_message: "未配置健康检查"
+
+# 供应链安全规则
+supply_chain:
+  risky_permissions:
+    - "execute:shell"
+    - "network:outbound"
+    - "write:system"
+    - "read:ssh_keys"
+    
+  blacklist_authors:
+    - "suspected_malicious_user"
+    - "unverified_source"
+    
+  trusted_sources:
+    - "official"
+    - "verified"
+    - "moonshotai"

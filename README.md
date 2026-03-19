@@ -1,16 +1,30 @@
-# CSV 编码转换器
+# 🔒 OpenClaw Security Auditor Skill
 
-自动检测 CSV 文件编码并转换为 UTF-8，解决中文乱码问题。
+**版本**: 1.0.0  
+**适配 OpenClaw 版本**: &gt;= 2026.1.29  
+**最后更新**: 2026-03-19
 
-## 安装
+专为安全运营团队设计的 OpenClaw 自动化安全审计工具，支持 CVE 漏洞扫描、七层安全基线检查、供应链风险评估。
 
-### 方式一：Kimi Claw 对话安装
-1. 打开 Kimi Claw
-2. 上传 `SKILL.md` 文件
-3. 说："安装这个 Skill"
+## ✨ 核心功能
 
-### 方式二：本地 OpenClaw
+- 🚨 **CVE 实时扫描**: 自动检测 2026 年最新高危漏洞 (CVE-2026-25253, CVE-2026-24763 等)
+- 🛡️ **七层基线审计**: 基于 OpenClaw Security Practice Guide 的完整安全检查
+- 🔍 **供应链分析**: 审查已安装 Skills 的权限和来源，识别 ClawHub 恶意包
+- 📊 **自动化报告**: 生成包含风险评分、修复命令的 Markdown/HTML 报告
+- ⚡ **一键加固**: 提供可直接执行的加固脚本 (需审批)
+
+## 🚀 快速开始
+
+### 安装步骤
+
+1. **克隆 Skill 到 OpenClaw 目录**:
+
 ```bash
-mkdir -p ~/.openclaw/skills/csv-encoding-converter
-cp SKILL.md main.py requirements.txt ~/.openclaw/skills/csv-encoding-converter/
-# 重启 OpenClaw 或刷新技能
+cd /path/to/openclaw
+mkdir -p skills/openclaw-security-auditor
+cd skills/openclaw-security-auditor
+
+# 下载 Skill 文件
+curl -O https://raw.githubusercontent.com/your-repo/openclaw-security/main/skill.json
+curl -O https://raw.githubusercontent.com/your-repo/openclaw-security/main/config/security_checks.yaml
