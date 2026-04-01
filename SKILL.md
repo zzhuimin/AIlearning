@@ -1,142 +1,314 @@
----
-name: openclaw-security-auditor
-display_name: 🔒 OpenClaw 安全加固审计器
-description: 全面的 OpenClaw 安全评估与加固工具，支持 CVE 漏洞扫描、配置基线检查、供应链风险评估和自动加固建议生成。适配 2026 年最新安全威胁模型。
-triggers: ["安全审计", "安全扫描", "CVE扫描", "漏洞检查", "OpenClaw安全", "安全加固", "基线检查", "风险评估"]
-permissions: ["read:file", "write:file", "execute:shell", "network:http", "system:info"]
-author: SecurityOps-Community
-version: 1.0.0
-min_openclaw_version: "2026.1.29"
----
+# RustScan Port Scanner Skill
 
-# 🔒 OpenClaw 安全加固审计器
+一个基于 RustScan 的高速端口扫描 OpenClaw Skill，可在几秒钟内完成全端口扫描，并支持自动调用 Nmap 进行深度分析。
 
-## 概述
+## 功能特性
 
-这是一个专业的 OpenClaw 安全审计技能，基于七层安全模型提供全面的安全评估。技能包括 CVE 漏洞扫描、配置基线检查、供应链风 险评估和自动加固建议生成。
+- **极速扫描**：基于 Rust 异步引擎，扫描 65,535 个端口仅需数秒
+- **智能联动**：扫描完成后自动调用 Nmap 进行服务识别和版本探测
+- **灵活配置**：支持全端口、指定端口范围、常用端口等多种扫描模式
+- **结果解析**：支持 Greppable 格式输出，便于程序化解析处理
+- **性能可调**：可调节批处理大小、超时时间、重试次数等参数
 
-## 核心功能
+## 适用场景
 
-- **🚨 CVE 实时扫描**: 自动检测 2026 年最新高危漏洞 (CVE-2026-25253, CVE-2026-24763 等)
-- **🛡️ 七层基线审计**: 基于 OpenClaw Security Practice Guide 的完整安全检查
-- **🔍 供应链分析**: 审查已安装 Skills 的权限和来源，识别恶意包
-- **📊 自动化报告**: 生成包含风险评分、修复命令的 Markdown/HTML 报告
-- **⚡ 一键加固**: 提供可直接执行的加固脚本（需用户审批）
+- 快速发现目标主机的开放端口
+- 渗透测试前期的信息收集
+- 网络安全审计和漏洞评估
+- 服务器端口暴露面检查
+- 内网资产发现和梳理
 
-## 技能触发的方法
-- "帮我做个安全审计"
-- "扫描一下OpenClaw的CVE漏洞"
-- "检查一下我的OpenClaw安全配置"
-- "执行安全加固扫描"
-- "做一次全面的风险评估"
+## 安装
 
-## 交互示例对话用户
-- "帮我做个OpenClaw安全审计"
+### 前置要求
 
-## 文件结构
+- RustScan 工具
+- Python 3.x（用于结果解析）
+- Nmap（可选，用于深度扫描）
 
-技能包含以下文件：
+### 安装 RustScan
 
-- `skill.json` - 技能元数据和配置
-- `README.md` - 技能说明文档
-- `config/security_checks.yaml` - 安全检查配置
-- `templates/audit_report.md` - 审计报告模板
+#### 方式一：使用 Cargo 安装（推荐）
+
+```bash
+# 检查 Rust 环境
+cargo --version
+
+# 安装 RustScan
+cargo install rustscan
+
+# 或使用 --locked 确保依赖兼容
+cargo install rustscan --locked
+```
+
+#### 方式二：使用 Docker
+
+```bash
+# 拉取镜像
+docker pull rustscan/rustscan:latest
+
+# 运行扫描
+docker run -it --rm --network host rustscan/rustscan:latest -a <target>
+```
+
+#### 方式三：从源码编译
+
+```bash
+# 克隆仓库
+git clone https://github.com/RustScan/RustScan.git
+cd RustScan
+
+# 编译
+cargo build --release
+
+# 使用编译后的二进制文件
+./target/release/rustscan -a <target>
+```
+
+### 验证安装
+
+```bash
+rustscan --version
+```
 
 ## 使用方法
 
-当用户提及以下关键词时触发技能：
-- 安全审计
-- 安全扫描
-- CVE扫描
-- 漏洞检查
-- OpenClaw安全
-- 安全加固
-- 基线检查
-- 风险评估
+### 基本语法
 
-## 执行流程
+```bash
+rustscan [参数] [目标]
+```
 
-### Phase 1: 环境信息采集
-通过交互式问卷收集环境信息：
-1. OpenClaw 版本号
-2. 部署模式（Docker/Kubernetes/Bare-metal）
-3. 当前 Gateway 绑定地址
-4. 认证模式
-5. 已安装 Skills 情况
-6. 网络暴露情况
+### 常用参数
 
-### Phase 2: CVE 漏洞扫描（紧急）
-检查以下 2026 年高危 CVE：
-- CVE-2026-25253 (CVSS 8.8): WebSocket RCE
-- CVE-2026-24763 (CVSS 7.8): Docker 沙箱命令注入
-- CVE-2026-25157 (CVSS 7.5): SSH 模式命令注入
-- CVE-2026-25593 (CVSS 6.5): ClawJacked Gateway 暴力破解
+| 参数 | 简写 | 说明 | 示例 |
+|------|------|------|------|
+| `--addresses` | `-a` | 目标地址（IP 或域名） | `-a 192.168.1.1` |
+| `--ports` | `-p` | 指定端口（逗号分隔或范围） | `-p 80,443` 或 `-p 1-1000` |
+| `--range` | `-r` | 端口范围 | `-r 1-65535` |
+| `--timeout` | `-t` | 连接超时（毫秒） | `-t 1500` |
+| `--batch-size` | `-b` | 并发连接数 | `-b 1500` |
+| `--greppable` | `-g` | Greppable 格式输出 | `-g` |
+| `--output` | `-o` | 输出到文件 | `-o result.txt` |
+| `--no-nmap` | - | 禁用自动 Nmap | `--no-nmap` |
+| `--ulimit` | - | 设置系统 ulimit | `--ulimit 5000` |
+| `--tries` | - | 重试次数 | `--tries 1` |
+| `--scan-order` | - | 扫描顺序 | `--scan-order random` |
 
-### Phase 3: 七层安全基线检查
-逐层执行安全检查：
-1. 网关绑定安全
-2. 认证安全
-3. 网络安全
-4. 容器隔离
-5. 运行时防护
-6. 凭据管理
-7. 监控审计
+## 使用示例
 
-### Phase 4: 供应链安全审计
-- 列出所有已安装 Skills 及其权限
-- 标记需要高危权限的 Skills
-- 检查已知恶意 Skills
+### 示例 1：基础全端口扫描
 
-### Phase 5: 生成报告
-生成包含以下内容的审计报告：
-1. 执行摘要和总体评分
-2. 漏洞详情
-3. 加固指南
-4. 合规检查表
+```bash
+# 扫描目标的所有端口（1-65535）
+rustscan -a scanme.nmap.org
 
-## 配置
+# 扫描多个目标
+rustscan -a "192.168.1.1,192.168.1.2"
+```
 
-可在 `skill.json` 中配置：
-- `audit_level`: basic/standard/comprehensive
-- `check_cves`: 要检查的 CVE 列表
-- `gateway_bind`: 期望的 Gateway 绑定地址
-- `strict_mode`: 是否启用严格模式
+**输出示例：**
+```
+.----. .-. .-. .----..---.  .----. .---.   .--.  .-. .-.
+| {}  }| { } |{ {__ {_   _}{ {__  /  ___} / {} \ |  `| |
+| .-. \| {_} |.-._} } | |  .-._} }\     }/  /\  \| |\  |
+`-' `-'`-----'`----'  `-'  `----'  `---' `-'  `-'`-' `-'
+The Modern Day Port Scanner.
+
+[~] Starting Portscan!
+Open 45.33.32.156:22
+Open 45.33.32.156:80
+[~] Scan completed in 3 seconds
+```
+
+### 示例 2：扫描指定端口范围
+
+```bash
+# 扫描 1-1000 端口
+rustscan -a 192.168.1.1 -p 1-1000
+
+# 扫描特定端口列表
+rustscan -a 192.168.1.1 -p 22,80,443,3306,5432,6379,8080,8443
+
+# 使用范围参数
+rustscan -a 192.168.1.1 -r 1-10000
+```
+
+### 示例 3：扫描常用服务端口
+
+```bash
+# 扫描最常用的服务端口
+rustscan -a 192.168.1.1 -p 21,22,23,25,53,80,110,143,443,445,3306,3389,5432,6379,8080,8443,9200,27017
+```
+
+### 示例 4：扫描后自动调用 Nmap 深度分析
+
+```bash
+# 扫描后自动执行 Nmap 服务识别和版本探测
+rustscan -a 192.168.1.1 -- -A -sV -sC
+
+# 执行 Nmap 漏洞扫描脚本
+rustscan -a 192.168.1.1 -- --script vuln
+
+# 自定义 Nmap 参数
+rustscan -a 192.168.1.1 -- -sV -sC -A --top-ports 100 -oN nmap_result.txt
+```
+
+### 示例 5：使用 Python 解析扫描结果
+
+```python
+import re
+import subprocess
+
+# 执行扫描并捕获输出
+result = subprocess.run(
+    ['rustscan', '-a', '192.168.1.1', '-g'],
+    capture_output=True,
+    text=True
+)
+
+# 解析 Greppable 格式输出
+open_ports = []
+for line in result.stdout.split('\n'):
+    match = re.search(r'Open\s+[\d\.]+:(\d+)', line)
+    if match:
+        open_ports.append(match.group(1))
+
+print(f"发现的开放端口: {', '.join(open_ports)}")
+
+# 生成端口列表字符串
+port_list = ",".join(open_ports)
+print(f"端口列表: {port_list}")
+```
+
+### 示例 6：高级配置扫描
+
+```bash
+# 调整扫描速度（增大并发数）
+rustscan -a 192.168.1.1 -b 3000
+
+# 随机扫描顺序（降低被检测概率）
+rustscan -a 192.168.1.1 --scan-order random -t 2000
+
+# 保存结果到文件
+rustscan -a 192.168.1.1 -g -o scan_result.txt
+
+# 综合优化参数
+rustscan -a 192.168.1.1 -b 2500 -t 800 --tries 1 --scan-order random
+```
+
+## 输出格式
+
+### 标准输出
+
+```
+[~] Starting Portscan!
+Open 192.168.1.1:22
+Open 192.168.1.1:80
+Open 192.168.1.1:443
+[~] Scan completed in 2 seconds
+```
+
+### Greppable 格式（-g）
+
+使用 `-g` 参数输出便于解析的格式：
+
+```
+Open 192.168.1.1:22
+Open 192.168.1.1:80
+Open 192.168.1.1:443
+```
+
+## 性能优化
+
+### 提高扫描速度
+
+```bash
+# 增大批处理大小（可能增加被检测风险）
+rustscan -a 192.168.1.1 -b 3000
+
+# 减少重试次数
+rustscan -a 192.168.1.1 --tries 1
+
+# 降低超时时间（适用于低延迟网络）
+rustscan -a 192.168.1.1 -t 500
+```
+
+### 调整系统限制
+
+```bash
+# 查看当前限制
+ulimit -n
+
+# 临时提高限制
+ulimit -n 65535
+
+# 或在 RustScan 中设置
+rustscan -a 192.168.1.1 --ulimit 5000
+```
+
+## 故障排除
+
+### 常见问题
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| `ulimit` 错误 | 文件描述符限制过低 | `ulimit -n 65535` 或 `--ulimit 5000` |
+| 连接超时 | 网络延迟高 | 增加 `-t` 参数值 |
+| 权限被拒绝 | 扫描特权端口 | 使用 `sudo` 运行 |
+| 扫描速度慢 | 批处理大小过小 | 增加 `-b` 参数 |
+| 结果不准确 | 防火墙/IDS | 调整 `--tries` 和 `-t` |
+| Nmap 未找到 | 未安装 Nmap | `apt install nmap` 或 `--no-nmap` |
+
+### Docker 运行问题
+
+```bash
+# 如果网络模式不兼容，使用桥接模式
+docker run -it --rm rustscan/rustscan:latest -a <target>
+
+# 挂载当前目录保存结果
+docker run -it --rm -v $(pwd):/output rustscan/rustscan:latest -a <target> -o /output/result.txt
+```
 
 ## 注意事项
 
-1. 所有敏感操作都需要用户明确批准
-2. 只读检查会先执行，不会修改系统
-3. 加固操作需要用户确认后才执行
-4. 提供完整的回滚方案
+### 权限要求
 
-## 输出示例
+- 扫描 0-1024 特权端口需要 root 权限
+- 大规模扫描可能需要调整系统 ulimit
 
-```
-# OpenClaw 安全审计报告
-**审计时间**: 2026-03-19 16:48 GMT+8
-**目标版本**: OpenClaw 2026.1.30
-**总体评分**: 85/100 (良好)
+### 法律合规
 
-## 🚨 紧急发现 (P0)
-无紧急风险
+> ⚠️ **重要警告**
+> 
+> - **授权要求**：仅扫描您拥有明确授权的目标系统
+> - **法律合规**：未经授权的端口扫描可能违反当地法律法规
+> - **责任声明**：使用者需自行承担因未授权扫描导致的法律后果
+> - **测试环境**：建议在隔离的测试环境中学习和练习
 
-## 📊 七层安全基线检查
-| 层级 | 检查项 | 状态 | 备注 |
-|------|--------|------|------|
-| Layer 1 | 网关绑定 | ✅ 通过 | 绑定到 127.0.0.1 |
-| Layer 2 | 认证配置 | ✅ 通过 | Token 认证已启用 |
-| ... | ... | ... | ... |
+### 最佳实践
 
-## 🔧 立即加固命令
-```bash
-# 加固建议
-echo "安全配置已优化"
-```
+1. 在授权范围内进行扫描
+2. 生产环境扫描前先在测试环境验证
+3. 合理设置扫描速率，避免对目标系统造成影响
+4. 保存扫描结果用于后续分析和报告
 
-## 📋 详细发现
-详细的安全检查结果...
-```
+## 相关资源
 
-## 版本要求
+- [RustScan GitHub](https://github.com/RustScan/RustScan)
+- [RustScan 文档](https://github.com/RustScan/RustScan/wiki)
+- [Nmap 官方文档](https://nmap.org/book/)
+- [OpenClaw 文档](https://openclaw.dev)
 
-需要 OpenClaw 版本 >= 2026.1.29
+## 许可证
+
+本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request！
+
+## 致谢
+
+- [RustScan](https://github.com/RustScan/RustScan) - 极速端口扫描器
+- [Nmap](https://nmap.org/) - 网络扫描和安全审计工具
