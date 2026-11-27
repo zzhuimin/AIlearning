@@ -7,16 +7,13 @@
 #    Java4Shell (CVE-2026-114938)：JVM 构建、CPU 和 Base64 intrinsic 缓解。
 #    Nginx2Root：CVE-2026-123007 / 123633 / 123634 / 121810 / 113425，
 #       检查 HTTP/2、HTTP/3、解析器、邮件代理与独立的 SCTP 内核线索。
-#       https://nginx.org/en/security_advisories.html
 #    Apache2Root (CVE-2026-119618)：httpd、mod_http2 映射和 h2/h2c 线索。
-#       https://httpd.apache.org/security/vulnerabilities_24#CVE-2026-119618
 #
 #  Java 专项参考以下开源检查器：
 #    1) ubitquity/cve-2026-114938-java4shell-remediation
 #       scripts/check-java4shell.sh        —— 架构/CPU 特性/运行时进程 + 缓解参数
 #    2) Mahgal/java4shell-check
-#       java4shell_check.py                —— 精确受影响版本表、--json、--demo、
-#                                             --apps 应用清点、CI 退出码
+#       java4shell_check.py                —— 精确受影响版本表、--json、CI 退出码
 #    3) nu0l/Java4Shell-LocalScanner
 #       java4shell.go                      —— JDK 目录发现、release 元数据解析、
 #                                             进程内 libjvm.so 设备号/inode 校验、
@@ -25,15 +22,14 @@
 #  判定原则：版本、磁盘配置与运行证据分别报告，厂商回补需独立核验。
 #    * 只读：不发送检测载荷，不联网，默认仅写临时报告数据；
 #    * 只采集证据、不猜：证据不足时给出 unknown，而不是猜 affected / safe；
-#    * 明确的退出码，可直接当 CI / 基线核查的门禁。
-#
-#  退出码：0 未命中失败级别；1 命中 --fail-on（默认 affected,potential）；
-#          2 参数/IO 错误；3 无门禁命中且证据不足或覆盖不完整。
-# ========
+#    * JSON 的 result 用于判读。退出码区分风险、执行错误和待核查。
+#    * 退出码：0 已检查范围未命中门禁，1 命中风险（即使有覆盖缺口），
+#      2 参数错误或执行失败，3 未命中但证据不足。全量优先级为 2、1、3、0。
+# =============================================================================
+
 set -u
 
 CVE="CVE-2026-114938"
-NICKNAME="Java4Shell"
 RULES_AS_OF="2026-11-18"
 PROG=${0##*/}
 SCRIPT_VERSION="1.2.0"
@@ -45,118 +41,43 @@ ARCH_NORM=$(printf '%s' "$ARCH_RAW" | tr '[:upper:]' '[:lower:]')
 # ---------------------------------------------------------------------------
 # 默认参数
 # ---------------------------------------------------------------------------
-FORMAT=""
-OUT=""
-DETAILS=0
-DEMO=0
 NO_PROC=0
 PROC_ONLY=0
-QUIET=0
-CPUINFO=""
-APPS_DIR=""
-APPS_DEPTH=3
-FAIL_ON="affected,potential"
-ASSUME_FEFF=0
 JCMD=0
 ROOT_DEPTH=8
-JDK_ARGS=()
+PROCESS_SCAN_LIMIT=1024
+MAP_SCAN_MAX_BYTES=1048576
+MAP_SCAN_TOTAL_BYTES=67108864
+APACHE_MAP_SCAN_MAX_BYTES=1048576
+APACHE_MAP_SCAN_TOTAL_BYTES=67108864
+DIRECTORY_SCAN_LIMIT=5000
+DIRECTORY_SCAN_SECONDS=20
+SCAN_TIMEOUT_SECONDS=60
+SCAN_DEADLINE_ACTIVE=0
 PID_ARGS=()
-JAVA_BINS=()
 ROOT_ARGS=()
 
 WORK=""
 FIND_FILE=""
 WARN_FILE=""
-APP_FILE=""
 ACTIVE_FILE=""
 CPU_STATE="unknown"
 CPU_SOURCE=""
 CPU_COUNTS="0 0 0"
-LIMITED_PROCS=0
 ROOT_COVERAGE_FILE=""
 ROOT_DEPTH_BOUNDARIES=0
 ROOT_SCAN_ERRORS=0
+LIMITED_PROCS=0
+JAVA_PROC_SCAN_UNAVAILABLE=false
+JAVA_PROC_VISIBILITY_LIMITED=false
+JAVA_PROC_ENTRIES=0
+JAVA_PROC_BUDGET_REACHED=false
+JAVA_MAP_BYTES_READ=0
+JAVA_MAP_BUDGET_REACHED=false
+JAVA_ROOT_BUDGET_REACHED=false
 
 # 必需的 CPU 特性（x86-64）
 REQ_FEATURES="avx512f avx512bw avx512vbmi bmi2"
-
-# 应用清点：Calif 演示过的产品
-PREAUTH_APPS="keycloak jira confluence artifactory jenkins pingfederate"
-AUTH_APPS="kafka solr elasticsearch gerrit spinnaker"
-
-# ---------------------------------------------------------------------------
-# 帮助
-# ---------------------------------------------------------------------------
-usage() {
-cat <<EOF
-Java4Shell / Nginx2Root / Apache2Root 主机暴露面检测（$PROG v$SCRIPT_VERSION）
-
-用法:
-  $PROG                         # 同时盘点 Java、NGINX 和 Apache
-  $PROG --all [--json] [--jcmd] [--nginx-config FILE] [--apache-config FILE]
-  $PROG --java4shell [选项]
-  $PROG --apache2root [--json] [--apache-path PATH] [--apache-config FILE]
-  $PROG --nginx2root [--json] [--nginx-path PATH] [--nginx-config FILE]
-
-  默认行为：核查 Java、NGINX 和 Apache 的本机证据，不联网。
-  NGINX：五项 CVE 的上游版本参考、配置和 SCTP 线索。
-  Apache：CVE-2026-119618 的 httpd / mod_http2 版本、映射与协议线索。
-  Web 服务专项的版本命中仅作为风险门禁，配置线索不代表已生效。
-
-选项:
-  --jdk PATH            指定 JDK Home（可重复）；指定后不再自动发现安装目录
-  --root DIR            额外递归扫描该目录里的嵌入式运行时（可重复，找 libjvm.so）
-  --root-depth N        配合 --root，最大递归深度（默认 8）
-  --jcmd                用 jcmd 读取 JVM 真实生效的 flags（需 attach，可能短暂停顿
-                        目标 JVM；仅在目标与当前用户相同时才会尝试）
-  --pid PID             只检查指定进程（可重复）
-  --processes-only      只检查进程，跳过安装目录发现
-  --no-processes        跳过进程检查，只盘点安装目录
-  --java-path PATH      额外对该 java 可执行文件跑一次 "java -version" 版本门禁
-  --cpuinfo PATH        用指定文件替代 /proc/cpuinfo（离线/镜像核查用）
-  --apps DIR            额外清点该目录下已知受影响的 Java 应用（默认深度 3）
-  --apps-depth N        配合 --apps，指定递归深度（默认 3）
-  --demo                跑内置固定样本（不采集本机任何数据，可重复复现）
-  --json                等价于 --format json
-  --csv                 等价于 --format csv
-  --format FMT          txt | json | csv（默认 txt，或按 --out 扩展名推断）
-  --out FILE            写入新文件（文件已存在则报错，不覆盖）
-  --details             TXT 报告展开全部资产与证据
-  --fail-on LIST        命中即退出 1，逗号分隔（默认 "affected,potential"）
-  --assume-flags-effective
-                        允许用明确的 JVM 启动参数进行估算；报告仍区分估算与 jcmd 实测
-  --quiet               抑制进度提示
-  -h, --help            显示本帮助
-  -V, --version         显示版本
-
-退出码:
-  0  未命中 --fail-on
-  1  命中 --fail-on（默认：存在 affected 或 potential 资产）
-  2  参数或 IO 错误
-  3  无失败项，但存在无法判断（unknown）的资产
-
-示例:
-  $PROG
-  $PROG --details
-  $PROG --json --out report.json
-  $PROG --jdk /opt/jdk-17 --jdk /opt/jdk-21 --no-processes
-  $PROG --processes-only --pid 1234
-  $PROG --java-path /usr/bin/java --cpuinfo /mnt/image/proc_cpuinfo.txt
-  $PROG --apps /opt
-  $PROG --demo
-
-判定口径:
-  受影响 = 已知受影响构建 + 运行环境可见 AVX-512 VBMI + 未发现有效缓解参数
-  待确认 = 版本/构建存在风险线索，但厂商补丁、CPU 或有效 JVM 参数未确认
-  已缓解 = 有效参数证据显示已禁用 Base64 intrinsic 或限制 AVX 级别 <= 2
-  不受影响 = 已确认修复，或构建/架构/CPU 条件超出影响范围
-  无法判断 = 缺少构建身份或版本证据
-
-临时缓解: -XX:-UseBASE64Intrinsics ，或仅在 x86-64 HotSpot 上用 -XX:UseAVX=2
-修复构建: 17.0.21.1 / 21.0.13.1 / 25.0.5.1 / 27.0.1.1（Oracle）
-          Corretto 对应 17.0.21.1.2 / 21.0.13.1.2 / 25.0.5.1.2 / 27.0.1.1.4
-EOF
-}
 
 # ---------------------------------------------------------------------------
 # 基础工具
@@ -167,9 +88,33 @@ lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 
 trim() { printf '%s' "${1:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 
-die() { printf '错误: %s\n' "$*" >&2; exit 2; }
+# 已知执行错误通过标准输出的 JSON 报告。
+die() {
+    local message
+    message=$(json_escape "$1" 2>/dev/null) || message='Check the supplied options, paths and file permissions.'
+    printf '{"result":"pending","result_reason":"invalid_arguments_or_io_failure","exit_code":2,"error":"invalid_arguments_or_io_failure","message":"%s"}\n' "$message"
+    exit 2
+}
 
-note_progress() { [ "$QUIET" -eq 1 ] || printf '[i] %s\n' "$*" >&2; }
+scan_exit_code() {
+    case $1 in
+        no_risk) printf 0 ;;
+        risk) printf 1 ;;
+        pending) printf 3 ;;
+        *) printf 2 ;;
+    esac
+}
+
+run_timed_command() {
+    local timer=$1
+    shift
+    if ((SCAN_DEADLINE_ACTIVE)); then
+        # Keep nested commands in the group controlled by the scan deadline.
+        "$timer" --foreground "$@"
+    else
+        "$timer" "$@"
+    fi
+}
 
 # 追加一条采集提示（写文件，跨子 shell 安全）
 warn() {
@@ -287,11 +232,7 @@ cpu_probe_darwin() {
 
 cpu_probe() {
     local raw
-    if [ -n "$CPUINFO" ]; then
-        [ -r "$CPUINFO" ] || die "--cpuinfo 无法读取: $CPUINFO"
-        raw=$(cpu_from_text < "$CPUINFO")
-        CPU_SOURCE=$CPUINFO
-    elif [ -r /proc/cpuinfo ] && grep -q . /proc/cpuinfo 2>/dev/null; then
+    if [ -r /proc/cpuinfo ] && grep -q . /proc/cpuinfo 2>/dev/null; then
         raw=$(cpu_from_text < /proc/cpuinfo)
         CPU_SOURCE=/proc/cpuinfo
     elif [ "$OS" = "Darwin" ] && have sysctl; then
@@ -299,7 +240,7 @@ cpu_probe() {
         CPU_SOURCE="sysctl"
     else
         CPU_STATE="unknown"
-        CPU_SOURCE="无 /proc/cpuinfo，CPU 条件未知"
+        CPU_SOURCE="CPU conditions are unknown because /proc/cpuinfo is unavailable."
         CPU_COUNTS="0 0 0"
         return
     fi
@@ -345,7 +286,7 @@ release_is_jdk() {
 
 release_get() {
     local f=$1 key=$2
-    [ -r "$f" ] || return 0
+    [[ -f $f && -r $f ]] || return 0
     awk -v k="$key" '
         {
             line = $0
@@ -361,45 +302,107 @@ release_get() {
         }' "$f" 2>/dev/null
 }
 
-# java 可执行文件 -> JDK Home（处理 .../jre/bin/java 的旧布局）
-java_root_of() {
-    local p=${1:-} root
-    root=$(dirname "$(dirname "$p")")
-    if [ "${root##*/}" = "jre" ] && [ ! -f "$root/release" ]; then
-        root=$(dirname "$root")
+# 旧版 JRE 仅在父目录确有可读 release 时归一化，避免丢失独立 JRE 的文件证据。
+normalize_java_root() {
+    local root=${1%/}
+    if [ "${root##*/}" = "jre" ] && [ ! -r "$root/release" ] &&
+       [ -r "${root%/*}/release" ]; then
+        root=${root%/*}
     fi
     printf '%s' "$root"
 }
 
+# java 可执行文件 -> JDK/JRE Home（兼容 .../jre/bin/java 的旧布局）。
+java_root_of() {
+    local p=${1:-} root
+    root=$(dirname "$(dirname "$p")")
+    normalize_java_root "$root"
+}
+
+# 缺少 release 版本时，读取本机实际运行库/启动器所属的 OpenJDK 8 RPM 包。
+# 不执行 java，不根据目录名称推测；仅供磁盘安装清点，不能证明进程运行版本。
+installation_rpm_metadata() {
+    local root=$1 file row name version vendor pattern timeout_bin
+    have rpm && timeout_bin=$(type -P timeout || type -P gtimeout) || return 1
+    pattern='^1\.8\.0\.([0-9]+)\.b([0-9]+)$'
+    for file in "$root"/lib/libjvm.so "$root"/lib/*/libjvm.so \
+        "$root"/lib/*/*/libjvm.so "$root"/jre/lib/*/libjvm.so \
+        "$root"/jre/lib/*/*/libjvm.so "$root/bin/java" "$root/jre/bin/java"; do
+        [ -f "$file" ] || continue
+        file=$(real_path "$(resolve_symlinks "$file")")
+        row=$(LC_ALL=C run_timed_command "$timeout_bin" -k 1s 2s rpm -qf --qf '%{NAME}\t%{VERSION}\t%{VENDOR}\n' -- "$file" 2>/dev/null) || continue
+        # 多包归属或非预期包名不作为确定版本证据。
+        [[ $row != *$'\n'* ]] || continue
+        IFS=$'\t' read -r name version vendor <<< "$row"
+        case $name in java-1.8.0-openjdk|java-1.8.0-openjdk-headless|java-1.8.0-openjdk-devel) ;; *) continue ;; esac
+        [[ $version =~ $pattern ]] || continue
+        version="1.8.0_${BASH_REMATCH[1]}-b${BASH_REMATCH[2]}"
+        # RPM 的包名明确标识 OpenJDK；保留真实厂商，不伪造发行商信息。
+        printf '%s\t%s\t%s\t%s' "$version" "$vendor" "$name" "$file"
+        return 0
+    done
+    return 1
+}
+
 java_name() {
-    case $(lower "${1##*/}") in
-        java|javaw|java.exe|javaw.exe) return 0 ;;
-        *) return 1 ;;
-    esac
+    [[ ${1##*/} =~ ^[Jj][Aa][Vv][Aa][Ww]?(\.[Ee][Xx][Ee])?$ ]]
 }
 
 # 列出待盘点的 JDK Home
 # 从 .../lib/server/libjvm.so 反推运行时根目录（不含 /proc 前缀）
 root_of_lib() { jvm_root_from_lib "" "$1"; }
 
+take_directory_entries() {
+    local remaining=$1 entry
+    while ((remaining > 0)) && LC_ALL=C IFS= read -r -d '' entry; do
+        printf '%s\0' "$entry"
+        remaining=$((remaining - 1))
+    done
+}
+
+bounded_directory_entries() {
+    local directory=$1 depth=$2 limit=$3 seconds=$4
+    local -a status
+    if ((seconds <= 0)); then
+        printf 'root_limit\n' >> "$ROOT_COVERAGE_FILE"
+        return
+    fi
+    if ! have timeout || ! have find; then
+        printf 'error\n' >> "$ROOT_COVERAGE_FILE"
+        return
+    fi
+    run_timed_command timeout -k 1s "$seconds" find "$directory" -xdev -maxdepth "$depth" -print0 2>/dev/null |
+        take_directory_entries "$((limit + 1))"
+    status=("${PIPESTATUS[@]}")
+    case ${status[0]} in
+        0|141) ;;
+        124|137) printf 'root_limit\n' >> "$ROOT_COVERAGE_FILE" ;;
+        *) printf 'error\n' >> "$ROOT_COVERAGE_FILE" ;;
+    esac
+}
+
 # --root：在给定目录里找嵌入式运行时的 libjvm.so，反推 Home
 scan_root_dirs() {
-    local r entry home relative separators
+    local r entry home relative separators remaining=$DIRECTORY_SCAN_LIMIT
+    local deadline=$((SECONDS + DIRECTORY_SCAN_SECONDS))
     [ ${#ROOT_ARGS[@]} -gt 0 ] || return 0
     for r in "${ROOT_ARGS[@]}"; do
-        if ! have find || [ ! -d "$r" ]; then
+        if ((remaining == 0 || SECONDS >= deadline)); then
+            printf 'root_limit\n' >> "$ROOT_COVERAGE_FILE"
+            break
+        fi
+        if [ ! -d "$r" ]; then
             printf 'error\n' >> "$ROOT_COVERAGE_FILE"
-            warn "无法搜索安装目录: $r"
+            warn "Cannot search installation directory $r."
             continue
         fi
         r=$(real_path "$r")
-        if ! find "$r" -xdev -maxdepth "$ROOT_DEPTH" \
-                \( -type d -o -name libjvm.so \( -type f -o -type l \) \) -print0 \
-                > "$WORK/root-entries" 2>/dev/null; then
-            printf 'error\n' >> "$ROOT_COVERAGE_FILE"
-            warn "搜索安装目录时发生错误，结果可能不完整: $r"
-        fi
-        while IFS= read -r -d '' entry; do
+        while LC_ALL=C IFS= read -r -d '' entry; do
+            if ((remaining == 0 || SECONDS >= deadline)); then
+                printf 'root_limit\n' >> "$ROOT_COVERAGE_FILE"
+                break
+            fi
+            remaining=$((remaining - 1))
             if [ -d "$entry" ] && [ ! -L "$entry" ]; then
                 relative=${entry#"${r%/}/"}
                 separators=${relative//[^\/]/}
@@ -409,23 +412,16 @@ scan_root_dirs() {
                 fi
                 continue
             fi
+            [[ ${entry##*/} == libjvm.so && ( -f $entry || -L $entry ) ]] || continue
             home=$(root_of_lib "$entry")
             [ -n "$home" ] && [ -d "$home" ] || continue
             printf '%s\n' "$(real_path "$home")"
-        done < "$WORK/root-entries"
+        done < <(bounded_directory_entries "$r" "$ROOT_DEPTH" "$remaining" "$((deadline - SECONDS))")
     done
 }
 
 list_roots() {
-    local d j pat f
-    if [ ${#JDK_ARGS[@]} -gt 0 ]; then
-        for d in ${JDK_ARGS[@]+"${JDK_ARGS[@]}"}; do
-            [ -n "$d" ] || continue
-            printf '%s\n' "$(real_path "$(resolve_symlinks "$d")")"
-        done
-        scan_root_dirs
-        return
-    fi
+    local j pat f
 
     if [ -n "${JAVA_HOME:-}" ] && [ -d "${JAVA_HOME:-}" ]; then
         printf '%s\n' "$(real_path "$(resolve_symlinks "$JAVA_HOME")")"
@@ -467,7 +463,7 @@ list_roots() {
 range_assess() {
     local v=$1 base major first last fixed fixed_note
     if [[ $v =~ ^[0-9]+$ ]]; then
-        printf 'unknown\t仅有 Java 主版本号（%s），缺少可供范围判定的版本细节' "$v"
+        printf 'unknown\tJava major version %s alone is insufficient to assess the build.' "$v"
         return
     fi
     base=${v%%+*}
@@ -475,21 +471,21 @@ range_assess() {
     major=${major//[!0-9]/}
     case $major in
         17) first="17.0.6";    last="17.0.21.0.3";  fixed="17.0.21.1"
-            fixed_note="17.0.21.1（Oracle）/ 17.0.21.1.2（Corretto）" ;;
+            fixed_note="17.0.21.1 (Oracle) or 17.0.21.1.2 (Corretto)" ;;
         21) first="21.0.0";          last="21.0.13.0.3";  fixed="21.0.13.1"
-            fixed_note="21.0.13.1（Oracle）/ 21.0.13.1.2（Corretto）" ;;
+            fixed_note="21.0.13.1 (Oracle) or 21.0.13.1.2 (Corretto)" ;;
         25) first="25.0.0";          last="25.0.5.0.3";   fixed="25.0.5.1"
-            fixed_note="25.0.5.1（Oracle）/ 25.0.5.1.2（Corretto）" ;;
+            fixed_note="25.0.5.1 (Oracle) or 25.0.5.1.2 (Corretto)" ;;
         27) first="27.0.0";          last="27.0.1.0.3";   fixed="27.0.1.1"
-            fixed_note="27.0.1.1（Oracle）/ 27.0.1.1.4（Corretto）" ;;
+            fixed_note="27.0.1.1 (Oracle) or 27.0.1.1.4 (Corretto)" ;;
         8|11)
-            printf 'outside_scope\tJava %s 标准版本不在 Oracle 公布的受影响构建列表内' "$major"
+            printf 'outside_scope\tOracle does not list standard Java %s builds as affected.' "$major"
             return ;;
         '')
-            printf 'unknown\t无法从版本串中解析主版本号'
+            printf 'unknown\tCannot read the major version from the version string.'
             return ;;
         *)
-            printf 'unknown\tJava %s 不在已核对的受影响范围表（17/21/25/27）内，需按厂商公告确认' "$major"
+            printf 'unknown\tThe assessed ranges cover Java 17, 21, 25, and 27. Check the vendor advisory for Java %s.' "$major"
             return ;;
     esac
 
@@ -498,19 +494,19 @@ range_assess() {
         local build_pattern='\+([0-9]+)'
         if [[ $v =~ $build_pattern ]]; then build_number=${BASH_REMATCH[1]}; fi
         if [ -z "$build_number" ] || ! vge "$build_number" 10; then
-            printf 'unknown\tJava 17.0.6 缺少已核实的受影响构建号（基线 +10）'
+            printf 'unknown\tCannot verify that the Java 17.0.6 build meets the affected baseline of +10.'
             return
         fi
     fi
 
     if vge "$base" "$fixed"; then
-        printf 'candidate\t需核对厂商及完整修复构建（参考 %s）' "$fixed_note"
+        printf 'candidate\tCheck the vendor and full build number against the fixed builds (%s).' "$fixed_note"
     elif [ -n "$first" ] && vlt "$base" "$first"; then
-        printf 'outside_scope\t版本早于公开受影响范围（首受影响 %s）' "$first"
+        printf 'outside_scope\tThe version predates the first published affected version (%s).' "$first"
     elif vle "$base" "$last"; then
-        printf 'unfixed\t版本落在公开受影响范围（至 %s），修复构建为 %s' "$last" "$fixed_note"
+        printf 'unfixed\tThe version is in the published affected range through %s. Fixed builds are %s.' "$last" "$fixed_note"
     else
-        printf 'unknown\t版本位于"最后已知受影响构建 %s"与"首个已知修复构建 %s"之间，没有公开构建落在此处；请直接升级到 %s' \
+        printf 'unknown\tThe version falls between the last known affected build %s and first known fixed build %s. Upgrade to %s.' \
             "$last" "$fixed" "$fixed_note"
     fi
 }
@@ -547,13 +543,13 @@ build_assess() {
     vml=$(lower "$(trim "$vm")")
 
     if [ -z "$v" ]; then
-        printf 'unknown\t没有可用的 Java 版本元数据（release/version 输出缺失）'
+        printf 'unknown\tJava version metadata is unavailable from the release file or version output.'
         return
     fi
 
     case $vml in
         *openj9*)
-            printf 'outside_scope\t识别到 OpenJ9 VM；该 CVE 属于 HotSpot intrinsic，不在影响范围'
+            printf 'outside_scope\tThe identified VM is OpenJ9. This CVE affects a HotSpot intrinsic.'
             return ;;
     esac
 
@@ -567,29 +563,34 @@ build_assess() {
         if [[ $vl == oracle || $vl == "oracle corporation" ]]; then
             case $v in
                 8u511b33-perf|1.8.0_511-perf-b33)
-                    printf 'unfixed\tOracle Java SE 8u511b33-perf 在受影响列表内'
+                    printf 'unfixed\tThe affected builds include Oracle Java SE 8u511b33-perf.'
                     return ;;
                 8u513-perf|1.8.0_513-perf-b4|1.8.0_513-perf-b04)
-                    printf 'fixed\tOracle Java SE 8u513-perf 修复构建'
+                    printf 'fixed\tOracle Java SE 8u513-perf is a fixed build.'
                     return ;;
             esac
         fi
         local update legacy_update_pattern='^(1\.8\.0_|8u)([0-9]+)(-b[0-9]+|b[0-9]+)?$'
         if [[ $v =~ $legacy_update_pattern ]]; then
             update=${BASH_REMATCH[2]}
+            # 明确的 OpenJDK 产品证据支持 RPM 厂商为 CentOS/Rocky 等发行方的旧构建。
+            if [ "$pl" = openjdk ]; then
+                printf 'outside_scope\tThe identified standard OpenJDK 8 build is outside the disclosed affected range.'
+                return
+            fi
             case $vl in
                 openjdk|debian|ubuntu|canonical|"eclipse adoptium"|temurin|"amazon.com inc."|"amazon.com inc"|\
                 "azul systems, inc."|azul|"red hat, inc."|"red hat")
-                    printf 'outside_scope\t已识别的标准 OpenJDK 8 发行构建不在本次披露范围内'
+                    printf 'outside_scope\tThe identified standard OpenJDK 8 build is outside the disclosed affected range.'
                     return ;;
                 oracle|"oracle corporation")
                     if vlt "$update" 511; then
-                        printf 'outside_scope\t已识别的 Oracle Java 8 标准旧构建不在本次披露范围内'
+                        printf 'outside_scope\tThe identified older standard Oracle Java 8 build is outside the disclosed affected range.'
                         return
                     fi ;;
             esac
         fi
-        printf 'unknown\tJava 8 构建缺少适用的厂商规则'
+        printf 'unknown\tNo vendor rule applies to this Java 8 build.'
         return
     fi
 
@@ -598,10 +599,10 @@ build_assess() {
           ( ( $vl == oracle || $vl == "oracle corporation" ) && $pl == openjdk ) ]]; then
         case $v in
             17.0.21.1+2|21.0.13.1+2|25.0.5.1+2|27.0.1.1+4)
-                printf 'fixed\tOpenJDK 修复 GA 标签（%s）' "${base}"
+                printf 'fixed\tFixed OpenJDK GA tag (%s).' "${base}"
                 return ;;
             17.0.21|17.0.21.0.3|21.0.13|21.0.13.0.3|25.0.5|25.0.5.0.3|27.0.1|27.0.1.0.3)
-                printf 'unfixed\tOpenJDK 受影响 GA 标签（%s），缺少变更 8393212 的尾块长度检查' "${base}"
+                printf 'unfixed\tAffected OpenJDK GA tag (%s). The build lacks the fix from JDK-8393212.' "${base}"
                 return ;;
         esac
     fi
@@ -612,31 +613,31 @@ build_assess() {
             "oracle java se")
                 case $base in
                     8u511b33-perf|1.8.0_511-perf-b33|17.0.21.0.3|21.0.13.0.3|25.0.5.0.3|27.0.1.0.3)
-                        printf 'unfixed\tOracle Java SE 受影响构建（%s）' "$base"
+                        printf 'unfixed\tAffected Oracle Java SE build (%s).' "$base"
                         return ;;
                     17.0.21.1|21.0.13.1|25.0.5.1|27.0.1.1)
                         case $v in
-                            "$base+4") printf 'fixed\tOracle Java SE 修复构建（%s+4）' "$base"; return ;;
+                            "$base+4") printf 'fixed\tFixed Oracle Java SE build (%s+4).' "$base"; return ;;
                             "$base"+*)
                                 local oracle_lts_pattern='^\+4-lts(-[0-9]+)?$'
                                 if [[ ${v#"$base"} =~ $oracle_lts_pattern ]]; then
-                                    printf 'fixed\tOracle Java SE 修复构建（%s）' "$v"
+                                    printf 'fixed\tFixed Oracle Java SE build (%s).' "$v"
                                     return
                                 fi ;;
                         esac
-                        printf 'unknown\tOracle Java SE 版本缺少已核实的完整修复构建号（%s）' "$v"
+                        printf 'unknown\tCannot verify the full fixed build number for Oracle Java SE %s.' "$v"
                         return
                         ;;
                 esac ;;
             "oracle graalvm for jdk")
                 case $base in
                     17.0.21.0.3|21.0.13.0.3)
-                        printf 'unfixed\tOracle GraalVM for JDK 受影响构建（%s）' "$base"; return ;;
+                        printf 'unfixed\tAffected Oracle GraalVM for JDK build (%s).' "$base"; return ;;
                 esac ;;
             "oracle graalvm enterprise edition")
                 case $base in
                     21.3.20.0.3)
-                        printf 'unfixed\tOracle GraalVM Enterprise Edition 受影响构建（%s）' "$base"; return ;;
+                        printf 'unfixed\tAffected Oracle GraalVM Enterprise Edition build (%s).' "$base"; return ;;
                 esac ;;
         esac
     fi
@@ -651,7 +652,7 @@ build_assess() {
             21.0.13.1+2:21.0.13.1.2|21.0.13.1+2-lts:21.0.13.1.2|\
             25.0.5.1+2:25.0.5.1.2|25.0.5.1+2-lts:25.0.5.1.2|\
             27.0.1.1+4:27.0.1.1.4|27.0.1.1+4-fr:27.0.1.1.4)
-                printf 'fixed\tAmazon Corretto 已核实的修复发行版本'
+                printf 'fixed\tVerified fixed Amazon Corretto release.'
                 return ;;
         esac
     fi
@@ -662,25 +663,25 @@ build_assess() {
             17.0.19+10-1~deb12u2|17.0.21+9-1~deb12u1|17.0.21.0.3+1-1|\
 21.0.12.1+1-1~deb13u1|21.0.13+9-1~deb13u2|21.0.13+9-1-deb13u2-debian|21.0.13.0.3+1-1|\
 25.0.3+9-2~deb13u1|25.0.5+8-1~deb13u1|25.0.5+8-1|25.0.5.0.3+1-3|27.0.1.0.3+1-1)
-                printf 'unfixed\tDebian 跟踪器所列受影响包版本（%s）' "$v"
+                printf 'unfixed\tThe Debian Security Tracker lists package version %s as affected.' "$v"
                 return ;;
         esac
     fi
 
     case $pl in
         *graalvm*)
-            printf 'candidate\tGraalVM 需按其具体产品与构建确认补丁证据'
+            printf 'candidate\tCheck the patch evidence for this GraalVM product and build.'
             return ;;
     esac
 
     # ---- 版本形态校验 ----
     local version_pattern='^[0-9]{1,3}(\.[0-9]+){0,4}(\+[0-9]+([.-][A-Za-z0-9.~+_-]+)?)?$'
     if [[ ! $v =~ $version_pattern ]]; then
-        printf 'unknown\t没有可用的 Java 版本元数据（%s）' "$version"
+        printf 'unknown\tJava version metadata is unavailable for %s.' "$version"
         return
     fi
     if [ -z "$major" ] || [ "$major" -lt 8 ] || [ "$major" -gt 27 ]; then
-        printf 'unknown\tJava %s 超出已核对覆盖范围（8–27）' "${major:-?}"
+        printf 'unknown\tJava %s is outside the assessed version range (8 through 27).' "${major:-?}"
         return
     fi
 
@@ -690,7 +691,7 @@ build_assess() {
     assess=${r%%	*}
     evidence=${r#*	}
     if ! recognized_jdk_vendor "$vendor" "$vm"; then
-        extra="（厂商/产品未确认为 OpenJDK 系，按公开 OpenJDK 范围判定）"
+        extra=" The assessment uses the published OpenJDK range because the vendor or product is unverified."
         case $assess in
             fixed|unfixed) assess="candidate" ;;
         esac
@@ -711,22 +712,6 @@ flag_assessment() {
     else
         printf 'unknown'
     fi
-}
-
-launcher_flag_assessment() {
-    local flags=${1:-} flag base64=unknown avx=unknown
-    for flag in $flags; do
-        case $flag in
-            -XX:-UseBASE64Intrinsics) base64=false ;;
-            -XX:+UseBASE64Intrinsics) base64=true ;;
-            -XX:UseAVX=*) avx=${flag#-XX:UseAVX=} ;;
-        esac
-    done
-    flag_assessment "$base64" "$avx"
-}
-
-mitigation_from_flags() {
-    [[ $(launcher_flag_assessment "${1:-}") == mitigated ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -754,29 +739,28 @@ classify() {
 
 # 生成判定依据
 make_reason() {
-    local status=$1 build=$2 bevid=$3 cpu=$4 mit=$5 arch=$6 hint=${7:-}
+    local status=$1 build=$2 bevid=$3 cpu=$4 mit=$5 arch=$6
     local reason=""
     case $status in
         not_affected)
             case $build in
-                fixed)        reason="已确认修复：版本已达到修复构建。" ;;
-                outside_scope) reason="不在影响范围：$bevid" ;;
-                *)            reason="CPU/架构不满足漏洞条件：需 x86-64 且运行环境可见 avx512f、avx512bw、avx512vbmi、bmi2。" ;;
+                fixed)        reason="The version meets the fixed build requirement." ;;
+                outside_scope) reason="Outside the affected range. $bevid" ;;
+                *)            reason="The affected path requires x86-64 and all four CPU features (avx512f, avx512bw, avx512vbmi, and bmi2)." ;;
             esac ;;
         unknown)
-            reason="证据不足，无法判定。请核对构建、CPU 和 JVM 生效参数。$bevid" ;;
+            reason="Evidence is insufficient. Check the build, CPU, and effective JVM options. $bevid" ;;
         mitigated)
-            reason="已缓解：JVM 生效参数禁用了 Base64 intrinsic 或将 AVX 级别限制到 2 及以下。" ;;
+            reason="Effective JVM options disable the Base64 intrinsic or limit AVX to level 2 or lower." ;;
         affected)
-            reason="运行中 JVM 的构建与 CPU 符合受影响条件，生效参数显示相关指令路径未禁用。$bevid" ;;
+            reason="The running JVM build and CPU meet the affected conditions. Effective JVM options leave the affected path enabled. $bevid" ;;
         potential)
-            reason="存在风险线索，需进一步确认：$bevid"
-            [ "$mit" -eq 1 ] && reason="$reason 已观察到缓解参数，但未确认其为该 JVM 的有效参数。"
-            [ "$cpu" = "mixed" ] && reason="$reason 可见逻辑 CPU 的 AVX-512 特性不一致。"
-            [ "$build" = "unfixed" ] && [ "$cpu" = "unknown" ] && reason="$reason CPU 条件未知。"
+            reason="The evidence indicates a potential risk. $bevid"
+            [ "$mit" -eq 1 ] && reason="$reason The observed mitigation options still need runtime verification."
+            [ "$cpu" = "mixed" ] && reason="$reason Visible logical CPUs report different AVX-512 features."
+            [ "$build" = "unfixed" ] && [ "$cpu" = "unknown" ] && reason="$reason CPU conditions are unknown."
             ;;
     esac
-    [ -n "$hint" ] && reason="$reason $hint"
     printf '%s' "$reason"
 }
 
@@ -887,7 +871,7 @@ assess_jdk_build() {
 
 scan_installations() {
     local root version vendor product vm arch notes build cpu status mit flags feff vmname vmtext openj9
-    local bevid reason bevid_and_build lib lib_id matched
+    local bevid reason bevid_and_build lib lib_id matched rpm_meta rpm_name rpm_file
 
     while IFS= read -r root; do
         [ -n "$root" ] || continue
@@ -899,7 +883,7 @@ scan_installations() {
         done
         [ "$matched" -eq 0 ] || continue
         NOTES=""
-        version=""; vendor=""; product=""; vm=""; arch=""
+        version=""; vendor=""; product=""; vm=""; arch=""; vmname=""
         build="unknown"; bevid=""
 
         if [ -r "$root/release" ]; then
@@ -909,16 +893,27 @@ scan_installations() {
             vm=$(release_get "$root/release" JVM_VARIANT)
             vmname=$(release_get "$root/release" JAVA_VM_NAME)
             arch=$(release_get "$root/release" OS_ARCH)
-            [ -n "$version" ] || add_note "release 文件中没有 JAVA_VERSION/JAVA_RUNTIME_VERSION"
+            [ -n "$version" ] || add_note "The release file lacks JAVA_VERSION and JAVA_RUNTIME_VERSION."
         else
-            add_note "缺少 release 元数据（可能不是完整 JDK Home，或为嵌入式 JRE）"
+            add_note "The release file is missing. This directory can be an incomplete JDK or an embedded JRE."
         fi
 
         product=$(jdk_product "$root" "$vendor")
+        # 老版 CentOS/RHEL OpenJDK 8 可无 release，按实际文件的 RPM 归属补充磁盘版本。
+        if [ -z "$version" ]; then
+            rpm_meta=$(installation_rpm_metadata "$root") || rpm_meta=""
+            if [ -n "$rpm_meta" ]; then
+                IFS=$'\t' read -r version vendor rpm_name rpm_file <<< "$rpm_meta"
+                product="OpenJDK"
+                add_note "RPM file ownership supplies the disk version. Package=$rpm_name Vendor=$vendor File=$rpm_file"
+            else
+                add_note "Cannot obtain the version from OpenJDK 8 RPM file ownership."
+            fi
+        fi
 
         if [ -z "$arch" ]; then
             arch=$ARCH_RAW
-            add_note "release 缺少 OS_ARCH，按本机架构（$ARCH_RAW）判定"
+            add_note "The release file lacks OS_ARCH. The assessment uses the host architecture ($ARCH_RAW)."
         fi
 
         cpu=$(cpu_assess "$arch" "$CPU_STATE")
@@ -935,10 +930,10 @@ scan_installations() {
         case $vmtext in *openj9*) openj9=1 ;; *) openj9=0 ;; esac
         if [ "$openj9" -eq 1 ]; then
             build="outside_scope"
-            bevid="运行在 Eclipse OpenJ9（自有 Base64 实现，不经过 HotSpot intrinsic）"
+            bevid="Eclipse OpenJ9 supplies its own Base64 implementation."
             status="not_affected"
-            reason="OpenJ9 不使用 HotSpot 的 Base64 intrinsic，不在本次影响面"
-            add_note "OpenJ9 走自有实现；公告未单列该实现，若厂商有相反说明以厂商为准"
+            reason="OpenJ9 is outside the scope of this HotSpot CVE."
+            add_note "OpenJ9 supplies its own Base64 implementation. Check the vendor advisory for OpenJ9."
         else
             status=$(classify "$build" "$cpu" "$mit" 0 "$(norm_arch "$arch")" installation)
             reason=$(make_reason "$status" "$build" "$bevid" "$cpu" "$mit" "$(norm_arch "$arch")")
@@ -946,17 +941,77 @@ scan_installations() {
 
         emit_finding "install:$root" "installation" "$status" "$reason" "$build" "$bevid" \
             "$cpu" "$version" "$root" "$vendor" "$product" "$vm" "$arch" "$flags" "$feff" "" "$NOTES"
-    done < <(list_roots | LC_ALL=C sort -u)
+    # 先归一化再去重，避免 JAVA_HOME 指向 jre 时与父 JDK 重复清点。
+    done < <(list_roots | while IFS= read -r root; do
+        normalize_java_root "$root"
+        printf '\n'
+    done | LC_ALL=C sort -u)
 }
 
 # ---------------------------------------------------------------------------
 # 采集：进程
 # ---------------------------------------------------------------------------
+linux_process_paths() {
+    local -a status
+    find /proc -ignore_readdir_race -mindepth 1 -maxdepth 1 -name '[0-9]*' -print 2>/dev/null |
+        head -n "$((PROCESS_SCAN_LIMIT + 1))"
+    status=("${PIPESTATUS[@]}")
+    [[ ${status[1]} == 0 && ( ${status[0]} == 0 || ${status[0]} == 141 ) ]]
+}
+
+process_visibility_limited() {
+    local proc_status
+    [[ $OS == Linux && -r /proc/self/mountinfo ]] || return 0
+    [[ -r /proc/1/comm ]] || return 0
+    [[ -z $(container_hint /proc/self) ]] || return 0
+    proc_status=$(awk '
+        $5 == "/proc" {
+            for (i = 7; i <= NF && $i != "-"; i++) {}
+            if ($(i + 1) != "proc") next
+            found = 1
+            if ($4 != "/") limited = 1
+            n = split($6 "," $(i + 3), options, ",")
+            for (j = 1; j <= n; j++)
+                if (options[j] ~ /^hidepid=/ && options[j] !~ /^hidepid=(0|off)$/) limited = 1
+        }
+        END { if (found && !limited) print "full" }
+    ' /proc/self/mountinfo 2>/dev/null) || return 0
+    [[ $proc_status != full ]]
+}
+
+java_budget_reached() {
+    [[ $JAVA_PROC_BUDGET_REACHED == true || $JAVA_MAP_BUDGET_REACHED == true ||
+       $JAVA_ROOT_BUDGET_REACHED == true ]]
+}
+
 java_process_start() {
     sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
 }
 
 libjvm_meta() {
+    local LC_ALL=C used limit remaining data read_rc=0
+    IFS= read -r used < "$WORK/map-bytes" || return 1
+    remaining=$((MAP_SCAN_TOTAL_BYTES - used))
+    if ((remaining <= 0)); then
+        : > "$WORK/map-total-limit"
+        return 1
+    fi
+    limit=$MAP_SCAN_MAX_BYTES
+    if ((remaining < limit)); then limit=$remaining; fi
+    # The sentinel preserves the trailing newline so the byte count includes it.
+    data=$(head -c "$limit" -- "$1/maps" 2>/dev/null; read_rc=$?; printf '.'; exit "$read_rc") || read_rc=$?
+    data=${data%.}
+    used=$((used + ${#data}))
+    printf '%s\n' "$used" > "$WORK/map-bytes" || return 1
+    if ((${#data} >= limit)); then
+        if ((used >= MAP_SCAN_TOTAL_BYTES)); then
+            : > "$WORK/map-total-limit"
+        else
+            printf 'map_limit\n' >> "$ROOT_COVERAGE_FILE"
+        fi
+        return 1
+    fi
+    ((read_rc == 0)) || return 1
     awk '
         /\/libjvm\.so( \(deleted\))?$/ && $5 != "0" {
             dev = $4; inode = $5; path = $0
@@ -966,7 +1021,7 @@ libjvm_meta() {
             row = dev "\037" inode "\037" path
             if (!seen[row]++) print row "\037" $1
         }
-    ' "$1/maps" 2>/dev/null
+    ' <<< "$data"
 }
 
 mapping_identity() {
@@ -984,7 +1039,7 @@ mapping_identity() {
 jcmd_version() {
     local pid=$1 jc=$2 out
     have timeout || return 1
-    out=$(timeout -k 1s 3s "$jc" "$pid" VM.version 2>/dev/null) || return 1
+    out=$(run_timed_command timeout -k 1s 3s "$jc" "$pid" VM.version 2>/dev/null) || return 1
     printf '%s\n' "$out" | awk '
         / VM version / {
             for (i = 1; i < NF; ++i) {
@@ -1034,7 +1089,7 @@ handles_sigquit() {
 jcmd_flags() {
     local pid=$1 jc=$2 out="" b64="" avx=""
     have timeout || return 1
-    out=$(timeout -k 1s 3s "$jc" "$pid" VM.flags -all 2>/dev/null) || return 1
+    out=$(run_timed_command timeout -k 1s 3s "$jc" "$pid" VM.flags -all 2>/dev/null) || return 1
     [ -n "$out" ] || return 1
     b64=$(printf '%s\n' "$out" | awk '$2 == "UseBASE64Intrinsics" && ($3 == "=" || $3 == ":=") { print $4; exit }')
     avx=$(printf '%s\n' "$out" | awk '$2 == "UseAVX" && ($3 == "=" || $3 == ":=") { print $4; exit }')
@@ -1053,10 +1108,7 @@ jvm_root_from_lib() {
     [ "${libdir##*/}" = "lib" ] || { printf ''; return; }
     root="${libdir%/*}"
     if [ -n "$proc" ]; then root="$proc/root$root"; fi
-    if [ "${root##*/}" = "jre" ] && [ ! -f "$root/release" ]; then
-        root=${root%/*}
-    fi
-    printf '%s' "$root"
+    normalize_java_root "$root"
 }
 
 container_hint() {
@@ -1064,21 +1116,21 @@ container_hint() {
     if [ -r "$proc/cgroup" ]; then
         while IFS= read -r line; do
             case $(lower "$line") in
-                *kubepods*)   printf 'kubepods（cgroup 线索）'; return ;;
-                *docker*)     printf 'docker（cgroup 线索）'; return ;;
-                *libpod*)     printf 'libpod（cgroup 线索）'; return ;;
-                *containerd*) printf 'containerd（cgroup 线索）'; return ;;
-                */lxc*)       printf 'lxc（cgroup 线索）'; return ;;
-                *cri-o*|*crio-*) printf 'cri-o（cgroup 线索）'; return ;;
+                *kubepods*)   printf 'kubepods (cgroup hint)'; return ;;
+                *docker*)     printf 'docker (cgroup hint)'; return ;;
+                *libpod*)     printf 'libpod (cgroup hint)'; return ;;
+                *containerd*) printf 'containerd (cgroup hint)'; return ;;
+                */lxc*)       printf 'lxc (cgroup hint)'; return ;;
+                *cri-o*|*crio-*) printf 'cri-o (cgroup hint)'; return ;;
             esac
         done < "$proc/cgroup"
     fi
-    if [ -e "$proc/root/.dockerenv" ]; then printf 'docker（root 标记）'; return; fi
-    if [ -e "$proc/root/run/.containerenv" ]; then printf 'container（root 标记）'; return; fi
+    if [ -e "$proc/root/.dockerenv" ]; then printf 'docker (root marker)'; return; fi
+    if [ -e "$proc/root/run/.containerenv" ]; then printf 'container (root marker)'; return; fi
     ns=$(readlink "$proc/ns/pid" 2>/dev/null || echo "")
     initns=$(readlink /proc/1/ns/pid 2>/dev/null || echo "")
     if [ -n "$ns" ] && [ -n "$initns" ] && [ "$ns" != "$initns" ]; then
-        printf '独立 PID 命名空间'
+        printf 'Separate PID namespace'
         return
     fi
     printf ''
@@ -1119,7 +1171,7 @@ scan_processes() {
     local libmeta libpath libdev libino st mhex nhex verified range expected identity_source identity_rc
     local root root_disp version vendor product vm arch build bevid cpu status reason
     local flags feff mit fn notes container start1 start2
-    local measured_state assumed_state b64 eavx reported_version
+    local measured_state b64 eavx reported_version
     local bevid_and_build verify_problem libmeta2 libmeta3 jc jcf vmname vmtext
     local runtime_version disk_version version_conflict weak_identity
     local identity_confidence disk_hint_version disk_hint_vendor disk_hint_product disk_hint_build
@@ -1129,20 +1181,27 @@ scan_processes() {
         explicit=1
         pidlist=$(printf '%s\n' ${PID_ARGS[@]+"${PID_ARGS[@]}"})
     elif [ "$OS" = "Linux" ]; then
-        pidlist=$(for d in /proc/[0-9]*; do printf '%s\n' "${d#/proc/}"; done | LC_ALL=C sort -n)
+        pidlist=$(linux_process_paths) || JAVA_PROC_SCAN_UNAVAILABLE=true
     else
         return
     fi
 
     while IFS= read -r pid; do
         [ -n "$pid" ] || continue
+        if ((JAVA_PROC_ENTRIES >= PROCESS_SCAN_LIMIT)); then
+            JAVA_PROC_BUDGET_REACHED=true
+            break
+        fi
+        if [[ -f $WORK/map-total-limit ]]; then break; fi
+        JAVA_PROC_ENTRIES=$((JAVA_PROC_ENTRIES + 1))
+        pid=${pid#/proc/}
         proc="/proc/$pid"
         NOTES=""
 
         if [ ! -d "$proc" ]; then
             if [ "$explicit" -eq 1 ]; then
                 emit_finding "pid:$pid" "process" "unknown" \
-                    "进程不存在或已退出，未采集到任何证据。" "unknown" "进程不存在" \
+                    "The process is absent or has exited. No evidence is available." "unknown" "Process is absent" \
                     "$(cpu_assess "$ARCH_RAW" "$CPU_STATE")" "" "" "" "" "" "$ARCH_RAW" "" "false" "" ""
             fi
             continue
@@ -1168,8 +1227,8 @@ scan_processes() {
             if [ -d "$proc" ]; then LIMITED_PROCS=$((LIMITED_PROCS + 1)); fi
         fi
         if [ "$maps_ok" -eq 0 ] && { [ "$explicit" -eq 1 ] || [ "$named" -eq 1 ]; }; then
-            emit_finding "pid:$pid" "process" "unknown" "无法读取进程映射，无法核实运行中 JVM。" \
-                "unknown" "进程映射不可读" "$(cpu_assess "$ARCH_RAW" "$CPU_STATE")" \
+            emit_finding "pid:$pid" "process" "unknown" "Cannot verify the running JVM because its process maps are unreadable." \
+                "unknown" "Unreadable process maps" "$(cpu_assess "$ARCH_RAW" "$CPU_STATE")" \
                 "" "" "" "" "" "$ARCH_RAW" "" "false" "" ""
             continue
         fi
@@ -1177,12 +1236,11 @@ scan_processes() {
         if [ "$named" -eq 0 ] && [ "$has_jvm" -eq 0 ]; then
             if [ "$explicit" -eq 1 ]; then
                 emit_finding "pid:$pid" "process" "unknown" \
-                    "该 PID 既不是 Java 启动器，也未映射 HotSpot 库，无法判定。" "unknown" "非 Java 进程" \
+                    "Cannot identify a Java launcher or HotSpot mapping for this PID." "unknown" "Java process unverified" \
                     "$(cpu_assess "$ARCH_RAW" "$CPU_STATE")" "" "" "" "" "" "$ARCH_RAW" "" "false" "" ""
             fi
             continue
         fi
-        
 
         # File identity and JVM version evidence have independent lifetimes.
         verified=0
@@ -1200,9 +1258,9 @@ scan_processes() {
             mhex=${libdev%%:*}
             nhex=${libdev##*:}
             if [[ $libpath == *" (deleted)" ]]; then
-                verify_problem="运行中的 HotSpot 库已被删除，无法核对磁盘文件"
+                verify_problem="The mapped HotSpot library was deleted. Cannot check the disk file."
             elif ! st=$(file_id "$proc/root$libpath"); then
-                verify_problem="无法读取磁盘上对应的 libjvm.so 文件身份"
+                verify_problem="Cannot read the identity of the corresponding libjvm.so file on disk."
             elif [[ $mhex =~ ^[[:xdigit:]]+$ && $nhex =~ ^[[:xdigit:]]+$ ]]; then
                 expected="$((16#$mhex)) $((16#$nhex)) $libino"
                 identity_rc=0
@@ -1210,21 +1268,21 @@ scan_processes() {
                 case $identity_rc in
                     0) verified=1 ;;
                     2) weak_identity=1 ;;
-                    *) verify_problem="无法将运行中映射与磁盘文件关联" ;;
+                    *) verify_problem="Cannot match the running mapping to a disk file." ;;
                 esac
                 if [ "$identity_source" = map_files ] || [ "$weak_identity" -eq 1 ] ||
                    [ "$identity_rc" -ne 0 ]; then
-                    add_note "maps 设备号及 inode: $expected；磁盘 stat: $st"
+                    add_note "Mapping device and inode $expected. Disk stat $st."
                 fi
                 if [ "$weak_identity" -eq 1 ]; then
-                    add_note "inode 相同但设备号不同，无法读取 map_files 进一步核实"
+                    add_note "The inodes match, and the device numbers differ. Cannot read map_files to verify the identity."
                 fi
                 if [ "$verified" -eq 1 ] || [ "$weak_identity" -eq 1 ]; then
                     root=$(jvm_root_from_lib "$proc" "$libpath")
                 fi
             fi
         elif [[ -n $libmeta ]]; then
-            verify_problem="进程内存在多个不同的 HotSpot 库映射，无法确定运行实体"
+            verify_problem="The process maps several distinct HotSpot libraries. Cannot identify the active build."
         fi
 
         version=""; vendor=""; product=""; vm=""; arch=""
@@ -1238,33 +1296,32 @@ scan_processes() {
             product=$(jdk_product "$root" "$vendor")
             disk_version=$version
             if [ "$weak_identity" -eq 1 ]; then
-                add_note "未关联的磁盘 release 构建: ${disk_version:-未知}"
+                add_note "Unverified build from the disk release file (${disk_version:-unknown})."
             fi
             case $identity_source in
-                maps) add_note "已映射的 HotSpot 库与磁盘 JDK 的设备号和 inode 一致" ;;
-                map_files) add_note "已通过 map_files 核实映射对象与磁盘文件的设备号和 inode" ;;
+                maps) add_note "The HotSpot mapping and disk JDK file have the same device number and inode." ;;
+                map_files) add_note "The device number and inode from map_files match the disk file." ;;
             esac
             root_disp=${root#"$proc/root"}
             [ -n "$root_disp" ] || root_disp=$root
-            libmeta2=$(libjvm_meta "$proc")
-            if [ "$libmeta2" != "$libmeta" ]; then
-                verify_problem="采集期间进程映射发生变化（可能重启或重新映射）"
+            if ! libmeta2=$(libjvm_meta "$proc") || [ "$libmeta2" != "$libmeta" ]; then
+                verify_problem="The process mappings changed during collection."
             fi
         else
             root_disp=""
             if [ -n "$verify_problem" ]; then
-                add_note "$verify_problem；不采用磁盘启动器的版本，避免把已升级的磁盘版本当成运行版本"
+                add_note "$verify_problem The disk launcher version cannot verify the running build."
             else
-                add_note "无法核实 JVM 身份或 release 元数据（可能为不同用户/已删除文件/受限的 /proc）"
+                add_note "Cannot verify the JVM identity or release metadata. Check process ownership, deleted files, and /proc access."
             fi
         fi
         [ -n "$arch" ] || arch=$ARCH_RAW
 
         if { [ "$verified" -ne 1 ] && [ "$weak_identity" -ne 1 ]; } || [ -n "$verify_problem" ]; then
-            verify_problem=${verify_problem:-无法核实运行中 JVM 映像}
+            verify_problem=${verify_problem:-Cannot verify the running JVM image.}
             container=$(container_hint "$proc")
             start2=$(java_process_start "$pid")
-            [ "$start1" = "$start2" ] || verify_problem="采集期间进程已退出或身份发生变化"
+            [ "$start1" = "$start2" ] || verify_problem="The process exited or its identity changed during collection."
             emit_finding "pid:$pid" "process" "unknown" "$verify_problem" "unknown" "$verify_problem" \
                 "$(cpu_assess "$arch" "$CPU_STATE")" "$version" "$root_disp" "$vendor" "$product" "$vm" "$arch" \
                 "" "false" "$container" "$NOTES"
@@ -1279,52 +1336,47 @@ scan_processes() {
         feff="false"
         if [ -n "$flags" ]; then
             # 启动参数是可信的"启动证据"，但 JVM 有效值仍需按实际进程确认
-            if [ "$ASSUME_FEFF" -eq 1 ]; then
-                add_note "启动参数: ${flags}（已请求按启动参数估算，jcmd 实测优先）"
-            else
-                add_note "启动参数: ${flags}（启动证据，未确认该 JVM 的有效值）"
-            fi
+            add_note "Startup option hints (${flags}). The effective JVM options are unverified."
         fi
 
         # --- 生效参数（--jcmd，可选）：读 JVM 真实生效值，而不是启动器写法 ---
         measured_state=
-        assumed_state=unknown
         if [ "$JCMD" -eq 1 ] && [ "$has_jvm" -eq 1 ]; then
             jc=$(jcmd_bin)
             if [ -z "$jc" ]; then
-                add_note "未在 PATH 找到 jcmd，跳过生效参数探测"
+                add_note "Cannot query effective JVM options because jcmd is absent from PATH."
             elif [ "$(stat -c %u "$proc" 2>/dev/null)" != "$(id -u)" ]; then
-                add_note "目标 JVM 不属于当前用户，jcmd 无法 attach"
+                add_note "The target JVM has a different owner. jcmd cannot attach."
             elif ! handles_sigquit "$proc"; then
-                add_note "目标 JVM 未注册 SIGQUIT 处理器（attach 监听器未启用），跳过 jcmd"
+                add_note "The target JVM has no SIGQUIT handler. The scan skips jcmd."
             elif [ -n "$start1" ] && [ "$(java_process_start "$pid")" = "$start1" ] &&
                  [ "$(libjvm_meta "$proc")" = "$libmeta" ]; then
                 if jcf=$(jcmd_flags "$pid" "$jc"); then
                     read -r b64 eavx <<< "$jcf"
                     measured_state=$(flag_assessment "$b64" "$eavx")
                     if [ "$measured_state" != unknown ]; then feff=true; fi
-                    add_note "jcmd 生效参数：UseBASE64Intrinsics=$b64 UseAVX=$eavx"
+                    add_note "Effective JVM options from jcmd (UseBASE64Intrinsics=$b64 UseAVX=$eavx)."
                     if [ "$measured_state" = unknown ]; then
-                        add_note "实测参数不足以确认缓解状态"
+                        add_note "The effective JVM options are insufficient to verify mitigation."
                     fi
                 else
-                    add_note "jcmd 生效参数查询失败，启动参数仅作线索"
+                    add_note "The jcmd options query failed. The startup options are unverified hints."
                 fi
                 if [ "$(java_process_start "$pid")" = "$start1" ] &&
                    [ "$(libjvm_meta "$proc")" = "$libmeta" ] &&
                    reported_version=$(jcmd_version "$pid" "$jc"); then
                     if [[ $reported_version == *+* ]]; then
                         runtime_version=$reported_version
-                        add_note "jcmd 自报运行构建: $runtime_version；磁盘 release: ${disk_version:-未知}"
+                        add_note "Running build from jcmd ($runtime_version). Disk release build (${disk_version:-unknown})."
                         if runtime_version_conflicts "$runtime_version" "$disk_version"; then
                             version_conflict=1
                         fi
                     else
-                        add_note "jcmd 仅报告短版本 $reported_version，无法核对运行构建号"
+                        add_note "jcmd reports a short version ($reported_version). Cannot verify the running build number."
                     fi
                 fi
             else
-                add_note "jcmd 探测失败或超时（attach 未被响应），启动参数仅作线索"
+                add_note "The jcmd query failed or timed out. The startup options are unverified hints."
             fi
         fi
 
@@ -1332,12 +1384,12 @@ scan_processes() {
 
         # --- 采集期间身份是否变化 ---
         start2=$(java_process_start "$pid")
-        libmeta3=$(libjvm_meta "$proc")
         if [ -z "$start1" ] || [ "$start1" != "$start2" ] || [ ! -d "$proc" ] ||
+           ! libmeta3=$(libjvm_meta "$proc") ||
            [ "$libmeta3" != "$libmeta" ] || [ "$(file_id "$proc/root$libpath")" != "$st" ] ||
            { [ "$identity_source" = map_files ] && [ "$(file_id "$proc/map_files/$range")" != "$st" ]; }; then
-            emit_finding "pid:$pid" "process" "unknown" "采集期间进程已退出或身份发生变化。" \
-                "unknown" "进程已退出" "$(cpu_assess "$arch" "$CPU_STATE")" "" "" "" "" "" "$arch" "" "false" "" ""
+            emit_finding "pid:$pid" "process" "unknown" "The process exited or its identity changed during collection." \
+                "unknown" "Process exited" "$(cpu_assess "$arch" "$CPU_STATE")" "" "" "" "" "" "$arch" "" "false" "" ""
             continue
         fi
 
@@ -1359,17 +1411,6 @@ scan_processes() {
         case $measured_state in
             mitigated) fn=1; mit=1 ;;
             unmitigated) fn=1 ;;
-            '')
-                if [ "$ASSUME_FEFF" -eq 1 ]; then
-                    assumed_state=$(launcher_flag_assessment "$flags")
-                    case $assumed_state in
-                        mitigated) fn=1; mit=1 ;;
-                        unmitigated) fn=1 ;;
-                    esac
-                    if [ "$fn" -eq 1 ]; then
-                        add_note "裁决采用显式信任的启动参数，未通过 jcmd 核实"
-                    fi
-                fi ;;
         esac
         identity_confidence=strong
         [ "$weak_identity" -eq 0 ] || identity_confidence=weak
@@ -1383,16 +1424,16 @@ scan_processes() {
 
         if [ "$version_conflict" -eq 1 ]; then
             status=unknown
-            reason="jcmd 自报运行构建与磁盘 release 不一致"
+            reason="The running build from jcmd differs from the build in the disk release file."
             build=unknown
             bevid=$reason
             version=$runtime_version
             vendor="" product="" vm=""
         elif [ "$weak_identity" -eq 1 ]; then
             status=potential
-            reason="运行库身份未核实：inode 相同、设备号不同，磁盘构建仅供参考"
+            reason="The inodes match, and the device numbers differ. The disk build is an unverified hint."
             if [ "$disk_hint_build" = unfixed ]; then
-                reason="$reason；发现受影响的磁盘构建"
+                reason="$reason The disk build is in the affected range."
             fi
             build=candidate
             bevid=$reason
@@ -1407,17 +1448,13 @@ scan_processes() {
             vm=""
         elif [ "$openj9" -eq 1 ]; then
             build="outside_scope"
-            bevid="运行在 Eclipse OpenJ9（自有 Base64 实现，不经过 HotSpot intrinsic）"
+            bevid="Eclipse OpenJ9 supplies its own Base64 implementation."
             status="not_affected"
-            reason="OpenJ9 不使用 HotSpot 的 Base64 intrinsic，不在本次影响面"
-            add_note "OpenJ9 走自有实现；公告未单列该实现，若厂商有相反说明以厂商为准"
+            reason="OpenJ9 is outside the scope of this HotSpot CVE."
+            add_note "OpenJ9 supplies its own Base64 implementation. Check the vendor advisory for OpenJ9."
         else
             status=$(classify "$build" "$cpu" "$mit" "$fn" "$(norm_arch "$arch")")
             reason=$(make_reason "$status" "$build" "$bevid" "$cpu" "$mit" "$(norm_arch "$arch")")
-            case "$status:$assumed_state" in
-                mitigated:mitigated) reason="按显式信任的 JVM 启动参数估算为已缓解，尚无 jcmd 实测。" ;;
-                affected:unmitigated) reason="按显式信任的 JVM 启动参数估算为受影响，尚无 jcmd 实测。" ;;
-            esac
         fi
 
         emit_finding "pid:$pid" "process" "$status" "$reason" "$build" "$bevid" \
@@ -1431,10 +1468,15 @@ scan_processes() {
 scan_processes_other() {
     local pid exe root notes version vendor product vm arch cpu build bevid status reason bevid_and_build
     product=""
-    command -v ps >/dev/null 2>&1 || return
+    if ! have ps; then JAVA_PROC_SCAN_UNAVAILABLE=true; return; fi
     while read -r pid exe; do
         [ -n "$pid" ] || continue
         [ -n "$exe" ] || continue
+        if ((JAVA_PROC_ENTRIES >= PROCESS_SCAN_LIMIT)); then
+            JAVA_PROC_BUDGET_REACHED=true
+            break
+        fi
+        JAVA_PROC_ENTRIES=$((JAVA_PROC_ENTRIES + 1))
         java_name "$exe" || continue
         NOTES=""
         root=$(java_root_of "$exe")
@@ -1445,9 +1487,9 @@ scan_processes_other() {
             vendor=$(release_get "$root/release" IMPLEMENTOR)
             vm=$(release_get "$root/release" JVM_VARIANT)
             arch=$(release_get "$root/release" OS_ARCH)
-            add_note "运行中加载的库未核实，版本取磁盘启动器"
+            add_note "The scan uses the disk launcher version because the running library is unverified."
         else
-            add_note "无 release 元数据"
+            add_note "The release file is missing."
         fi
         [ -n "$arch" ] || arch=$ARCH_RAW
         cpu=$(cpu_assess "$arch" "$CPU_STATE")
@@ -1459,194 +1501,7 @@ scan_processes_other() {
         reason=$(make_reason "$status" "$build" "$bevid" "$cpu" 0 "$(norm_arch "$arch")")
         emit_finding "pid:$pid" "process" "$status" "$reason" "$build" "$bevid" \
             "$cpu" "$version" "$root" "$vendor" "$product" "$vm" "$arch" "" "false" "" "$NOTES"
-    done < <(ps -axww -o pid=,comm= 2>/dev/null)
-}
-
-# ---------------------------------------------------------------------------
-# 采集：java -version 门禁
-# ---------------------------------------------------------------------------
-scan_java_binary() {
-    local bin=$1 out version vendor vm arch product build bevid cpu status reason notes home full_version
-    [ -f "$bin" ] || die "java 可执行文件不存在: $bin"
-    [ -x "$bin" ] || die "java 不可执行: $bin"
-
-    out=""
-    if have timeout; then
-        out=$(timeout 30 "$bin" -version 2>&1 || true)
-    else
-        out=$("$bin" -version 2>&1 || true)
-    fi
-
-    version=$(printf '%s\n' "$out" | sed -n 's/.*version "\([^"]*\)".*/\1/p' | head -n 1)
-    full_version=$(printf '%s\n' "$out" | sed -n 's/.*Runtime Environment.*(build \([^, )]*\).*/\1/p' | head -n 1)
-    [ -z "$full_version" ] || version=$full_version
-    home=$(java_root_of "$(resolve_symlinks "$bin")")
-    vendor=""
-    if [ -n "$home" ]; then
-        vendor=$(release_get "$home/release" IMPLEMENTOR)
-    fi
-
-    notes=""
-    vm=""
-    case $(lower "$out") in
-        *openj9*) vm="OpenJ9" ;;
-        *hotspot*|*"server vm"*|*"client vm"*) vm="HotSpot" ;;
-    esac
-    product=""
-    if [ -n "$home" ]; then product=$(jdk_product "$home" "$vendor"); fi
-    if [ -z "$product" ]; then
-        case $(lower "$out") in
-            *"graalvm enterprise"*)
-                vendor=${vendor:-Oracle}
-                product="Oracle GraalVM Enterprise Edition" ;;
-            *graalvm*) product="GraalVM"; notes="版本输出提示 GraalVM" ;;
-            *"java(tm) se runtime environment"*)
-                vendor=${vendor:-Oracle}
-                product="Oracle Java SE" ;;
-        esac
-    fi
-    arch=$ARCH_RAW
-
-    cpu=$(cpu_assess "$arch" "$CPU_STATE")
-    bevid_and_build=$(assess_jdk_build "$home" "$version" "$vendor" "$product" "$vm")
-    build=$(printf '%s' "$bevid_and_build" | cut -f1)
-    bevid=$(printf '%s' "$bevid_and_build" | cut -f2-)
-    [ -n "$build" ] || build="unknown"
-
-    # -version 门禁没有可信的启动参数证据，按未缓解处理
-    status=$(classify "$build" "$cpu" 0 0 "$(norm_arch "$arch")" installation)
-    reason=$(make_reason "$status" "$build" "$bevid" "$cpu" 0 "$(norm_arch "$arch")" \
-        "（本项来自 java -version 门禁，未校验运行参数）")
-
-    emit_finding "java:$bin" "java-binary" "$status" "$reason" "$build" "$bevid" \
-        "$cpu" "$version" "$bin" "$vendor" "${product:-}" "${vm:-}" "$arch" "" "false" "" "$notes"
-}
-
-# ---------------------------------------------------------------------------
-# 采集：已知受影响应用目录
-# ---------------------------------------------------------------------------
-scan_apps() {
-    local root=$1 depth=$2 d name token label exposure
-    [ -d "$root" ] || die "--apps 路径不是目录: $root"
-    root=$(real_path "$root")
-
-    while IFS= read -r d; do
-        [ -n "$d" ] || continue
-        [ "$d" = "$root" ] && continue
-        name=${d##*/}
-        case $name in .*) continue ;; esac
-        token=$(printf '%s' "$name" | sed 's/[-_]//g' | tr '[:upper:]' '[:lower:]')
-        label=""
-        exposure=""
-        case $token in
-            *keycloak*)     label="Keycloak";     exposure="默认配置下无需认证即可触发 RCE" ;;
-            *jira*)         label="Atlassian Jira"; exposure="默认配置下无需认证即可触发 RCE" ;;
-            *confluence*)   label="Atlassian Confluence"; exposure="默认配置下无需认证即可触发 RCE" ;;
-            *artifactory*)  label="JFrog Artifactory"; exposure="默认配置下无需认证即可触发 RCE" ;;
-            *jenkins*)      label="Jenkins";      exposure="默认配置下无需认证即可触发 RCE" ;;
-            *pingfederate*) label="PingFederate"; exposure="默认配置下无需认证即可触发 RCE" ;;
-            *kafka*)        label="Apache Kafka Broker"; exposure="认证后可触发 RCE" ;;
-            *solr*)         label="Apache Solr";  exposure="认证后可触发 RCE" ;;
-            *elasticsearch*) label="Elasticsearch"; exposure="认证后可触发 RCE" ;;
-            *gerrit*)       label="Gerrit";       exposure="认证后可触发 RCE" ;;
-            *spinnaker*)    label="Spinnaker";    exposure="认证后可触发 RCE" ;;
-        esac
-        [ -n "$label" ] || continue
-        printf '%s\037%s\037%s\n' "$label" "$exposure" "$d" >> "$APP_FILE"
-    done < <(find "$root" -maxdepth "$depth" -type d -not -path '*/.*' 2>/dev/null | LC_ALL=C sort)
-}
-
-# ---------------------------------------------------------------------------
-# 采集：演示样本（完全不采集本机数据）
-# ---------------------------------------------------------------------------
-demo_cpuinfo() {
-    local extra=$1
-    local f="fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc bmi1 avx2 $extra"
-    printf 'processor\t: 0\nflags\t\t: %s\nprocessor\t: 1\nflags\t\t: %s\n' "$f" "$f"
-}
-
-run_demo() {
-    local with="avx512f avx512bw avx512vbmi bmi2"
-    local without="avx512f avx512bw bmi2"
-    local i=0 case_n case_label version vendor product vm flags cpu build bevid status reason cpuraw
-    local total=0 bad=0
-
-    demo_case() {
-        local label=$1 version=$2 vendor=$3 product=$4 vm=$5 flags=$6 cpuextra=$7 expect=$8
-        local cpuraw cpu build bevid mit status
-        cpuraw=$(demo_cpuinfo "$cpuextra" | cpu_from_text)
-        cpu=$(cpu_assess "x86_64" "$(printf '%s' "$cpuraw" | cut -d' ' -f1)")
-        bevid_and_build=$(build_assess "$version" "$vendor" "$product" "$vm")
-        build=$(printf '%s' "$bevid_and_build" | cut -f1)
-        bevid=$(printf '%s' "$bevid_and_build" | cut -f2-)
-        mit=0
-        mitigation_from_flags "$flags" && mit=1
-        status=$(classify "$build" "$cpu" "$mit" 1 amd64)
-
-        total=$((total + 1))
-        if [ "$FORMAT" != txt ]; then
-            emit_finding "demo:$total" demo "$status" "$label" "$build" "$bevid" "$cpu" "$version" "" "$vendor" "$product" "$vm" x86_64 "$flags" true "" ""
-            [ "$status" = "$expect" ] || bad=$((bad + 1))
-            return
-        fi
-        printf '[demo %d] %s\n' "$total" "$label"
-        printf '  Java: %s（厂商/产品: %s / %s）\n' "${version:-未知}" "${vendor:-未知}" "${product:-未知}"
-        printf '  CPU: x86_64，AVX-512 VBMI %s\n' "$(case $cpu in present) echo 存在;; absent) echo 不存在;; mixed) echo 不一致;; *) echo 未知;; esac)"
-        printf '  构建判定: %s\n' "$build"
-        printf '  判定: %s\n' "$(status_label "$status")"
-        [ "$status" = "$expect" ] || { printf '  [x] 与预期(%s)不一致\n' "$expect"; bad=$((bad + 1)); }
-        printf '\n'
-    }
-
-    [ "$FORMAT" != txt ] || printf '%s · %s 演示（固定样本，不采集本机数据）\n\n' "$NICKNAME" "$CVE"
-
-    demo_case "受影响 — OpenJDK 17.0.21 + AVX-512 VBMI" \
-        17.0.21 openjdk OpenJDK HotSpot "" "$with" affected
-
-    demo_case "已修复 — OpenJDK 21.0.13.1 + AVX-512 VBMI" \
-        21.0.13.1+2 openjdk OpenJDK HotSpot "" "$with" not_affected
-
-    demo_case "受影响 — Debian 21.0.13+9-1~deb13u2" \
-        21.0.13+9-1~deb13u2 debian "" HotSpot "" "$with" affected
-
-    demo_case "已缓解 — 17.0.21 且禁用 Base64 intrinsic" \
-        17.0.21 openjdk OpenJDK HotSpot "-XX:-UseBASE64Intrinsics" "$with" mitigated
-
-    demo_case "不受影响 — 17.0.21 但 CPU 无 VBMI" \
-        17.0.21 openjdk OpenJDK HotSpot "" "$without" not_affected
-
-    demo_case "无法判断 — 17.0.21.0.4（已知受影响与已修复之间的空档）" \
-        17.0.21.0.4 openjdk OpenJDK HotSpot "" "$with" unknown
-
-    case $FORMAT in
-        json) report_json ;;
-        csv) report_csv ;;
-        *) printf '合计 %d 个样本，异常 %d 个。\n' "$total" "$bad" ;;
-    esac
-    [ "$bad" -eq 0 ] || return 1
-    return 0
-}
-
-status_label() {
-    case $1 in
-        affected)     printf '受影响' ;;
-        potential)    printf '待确认' ;;
-        mitigated)    printf '已缓解' ;;
-        not_affected) printf '不受影响' ;;
-        unknown)      printf '无法判断' ;;
-        *)            printf '%s' "$1" ;;
-    esac
-}
-
-build_label() {
-    case $1 in
-        fixed)        printf '已修复' ;;
-        unfixed)      printf '未修复（受影响构建）' ;;
-        outside_scope) printf '范围外' ;;
-        candidate)    printf '需确认' ;;
-        unknown)      printf '未知' ;;
-        *)            printf '%s' "$1" ;;
-    esac
+    done < <(ps -axww -o pid=,comm= 2>/dev/null | head -n "$((PROCESS_SCAN_LIMIT + 1))")
 }
 
 # ---------------------------------------------------------------------------
@@ -1654,245 +1509,56 @@ build_label() {
 # ---------------------------------------------------------------------------
 total_count() { wc -l < "$FIND_FILE" 2>/dev/null | tr -d ' '; }
 status_count() { awk -F'\037' -v s="$1" '$3 == s { c++ } END { print c + 0 }' "$FIND_FILE"; }
-apps_count() { wc -l < "$APP_FILE" 2>/dev/null | tr -d ' '; }
 
-brief_name() {
-    local id=$1 kind=$2 version=$3
-    case $kind in
-        installation) printf '%s · Java %s' "${id#install:}" "${version:-未知}" ;;
-        *)            printf '%s · Java %s' "$id" "${version:-未知}" ;;
-    esac
-}
-
-txt_header() {
-    printf '%s · %s（规则 %s · 模式 %s · bash 单文件版）\n' "$NICKNAME" "$CVE" "$RULES_AS_OF" "$MODE_NAME"
-    printf '主机: %s / %s    CPU: %s（%s）\n' "$(hostname 2>/dev/null || echo unknown)" "$ARCH_RAW" "$CPU_STATE" "$CPU_SOURCE"
-}
-
-report_txt() {
-    local total affected potential mitigated notaffected unknown
-    local id kind status reason build bevid cpu version jhome vendor product vm arch flags feff container notes identity_confidence disk_hint_version disk_hint_vendor disk_hint_product disk_hint_build
-
-    total=$(total_count)
-    affected=$(status_count affected)
-    potential=$(status_count potential)
-    mitigated=$(status_count mitigated)
-    notaffected=$(status_count not_affected)
-    unknown=$(status_count unknown)
-
-    txt_header
-    if [ "$total" -eq 0 ]; then
-        printf '未找到可评估的 Java 资产。\n'
-    else
-        printf '已检查 %d 项 · 受影响 %d · 待确认 %d · 已缓解 %d · 不受影响 %d · 无法判断 %d\n' \
-            "$total" "$affected" "$potential" "$mitigated" "$notaffected" "$unknown"
-    fi
-
-    if [ "$total" -gt 0 ]; then
-        if [ "$affected" -gt 0 ]; then
-            printf '结论: 存在受影响资产，请立即升级到修复构建，或加缓解参数后重启\n'
-        elif [ "$potential" -gt 0 ]; then
-            printf '结论: 无已确认受影响资产，但有需确认项，请核对构建来源与厂商补丁\n'
-        elif [ "$unknown" -gt 0 ]; then
-            printf '结论: 未命中失败级别，但存在证据不足的资产，建议补充 release/CPU 证据\n'
-        else
-            printf '结论: 未发现受影响资产\n'
-        fi
-    fi
-
-    if [ "$DETAILS" -eq 0 ]; then
-        while IFS=$'\037' read -r id kind status reason build bevid cpu version jhome vendor product vm arch flags feff container notes identity_confidence disk_hint_version disk_hint_vendor disk_hint_product disk_hint_build; do
-            case $status in
-                affected|potential|unknown)
-                    printf '  %s  %s\n' "$(status_label "$status")" "$(brief_name "$id" "$kind" "$version")" ;;
-            esac
-        done < "$FIND_FILE"
-
-        local napps
-        napps=$(apps_count)
-        if [ "$napps" -gt 0 ]; then
-            printf '  已发现 %s 个已知受影响应用的安装目录（--details 查看）\n' "$napps"
-        fi
-        local nwarn
-        nwarn=$(wc -l < "$WARN_FILE" 2>/dev/null | tr -d ' ')
-        [ "${nwarn:-0}" -gt 0 ] && printf '提示: %s 条采集提示（--details 查看）\n' "$nwarn"
-        return
-    fi
-
-    # ---- 详细模式 ----
-    while IFS=$'\037' read -r id kind status reason build bevid cpu version jhome vendor product vm arch flags feff container notes identity_confidence disk_hint_version disk_hint_vendor disk_hint_product disk_hint_build; do
-        printf '\n=== %s [%s]\n' "$id" "$kind"
-        printf '  状态      : %s（构建判定: %s；CPU: %s）\n' "$(status_label "$status")" "$(build_label "$build")" "$cpu"
-        printf '  版本      : %s\n' "${version:-未知}"
-        printf '  厂商/产品 : %s / %s\n' "${vendor:-未知}" "${product:-未知}"
-        printf '  VM/架构   : %s / %s\n' "${vm:-未知}" "${arch:-未知}"
-        printf '  Java Home : %s\n' "${jhome:-—}"
-        if [ -n "$disk_hint_build" ]; then
-            printf '  磁盘证据  : %s · %s / %s · %s（仅供参考）\n' \
-                "${disk_hint_version:-未知}" "${disk_hint_vendor:-未知}" "${disk_hint_product:-未知}" "$(build_label "$disk_hint_build")"
-        fi
-        [ -n "$flags" ] && printf '  启动参数  : %s（有效率: %s）\n' "$flags" "$feff"
-        [ -n "$container" ] && printf '  容器线索  : %s\n' "$container"
-        printf '  依据      : %s\n' "${reason:-—}"
-        [ -n "$notes" ] && printf '  备注      : %s\n' "$notes"
-    done < "$FIND_FILE"
-
-    local napps nwarn
-    napps=$(apps_count)
-    printf '\n=== 已知受影响应用清点\n'
-    if [ "${napps:-0}" -eq 0 ]; then
-        printf '  未发现已知受影响应用的安装目录%s。\n' "${APPS_DIR:+（扫描 $APPS_DIR）}"
-        printf '  注意：目录存在本身不等于可利用，仍需核查该应用实际使用的 JVM。\n'
-    else
-        while IFS=$'\037' read -r id kind path; do
-            printf '  - %s（%s）— %s\n' "$id" "$kind" "$path"
-        done < "$APP_FILE"
-        printf '  注意：目录存在本身不等于可利用，仍需核查该应用实际使用的 JVM。\n'
-    fi
-
-    nwarn=$(wc -l < "$WARN_FILE" 2>/dev/null | tr -d ' ')
-    if [ "${nwarn:-0}" -gt 0 ]; then
-        printf '\n=== 采集提示\n'
-        while IFS= read -r id; do printf '  - %s\n' "$id"; done < "$WARN_FILE"
-    fi
-}
-
+# Preserve valid UTF-8 and replace malformed bytes before writing JSON.
 json_escape() {
-    printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+    printf '%s' "${1:-}" | LC_ALL=C awk '
+        function utf8_width(line, offset,    lead, width, code, j) {
+            lead=octet[substr(line,offset,1)]
+            if (lead >= 194 && lead <= 223) width=2
+            else if (lead >= 224 && lead <= 239) width=3
+            else if (lead >= 240 && lead <= 244) width=4
+            else return 0
+            if (offset+width-1 > length(line)) return 0
+
+            code=octet[substr(line,offset+1,1)]
+            # Reject overlong encodings, surrogate code points and values above U+10FFFF.
+            if ((lead==224 && code<160) || (lead==237 && code>=160) ||
+                (lead==240 && code<144) || (lead==244 && code>=144)) return 0
+            for (j=1; j<width; j++) {
+                code=octet[substr(line,offset+j,1)]
+                if (code<128 || code>191) return 0
+            }
+            return width
+        }
+        BEGIN {
+            for (i=1; i<32; i++) controls[sprintf("%c",i)]=sprintf("\\u%04x",i)
+            for (i=128; i<256; i++) octet[sprintf("%c",i)]=i
+        }
+        { if (NR>1) printf "\\n"
+          for (i=1; i<=length($0); i++) {
+              c=substr($0,i,1)
+              if (c=="\\") printf "\\\\"
+              else if (c=="\"") printf "\\\""
+              else if (c in controls) printf "%s",controls[c]
+               else if (c in octet) {
+                   width=utf8_width($0,i)
+                   if (width==0) printf "\\ufffd"
+                   else {
+                       printf "%s",substr($0,i,width)
+                       i+=width-1
+                   }
+               }
+              else printf "%s",c
+          }
+        }'
 }
 
-jstr() { printf '"%s"' "$(json_escape "${1:-}")"; }
-
-json_notes() {
-    local s=${1:-} item sep="" out=""
-    printf '['
-    [ -n "$s" ] || { printf ']'; return; }
-    local oldifs=$IFS
-    IFS='|'
-    for item in $s; do
-        item=$(trim "$item")
-        [ -n "$item" ] || continue
-        printf '%s%s' "$sep" "$(jstr "$item")"
-        sep=","
-    done
-    IFS=$oldifs
-    printf ']'
-}
-
-report_json() {
-    local id kind status reason build bevid cpu version jhome vendor product vm arch flags feff container notes identity_confidence disk_hint_version disk_hint_vendor disk_hint_product disk_hint_build
-    local first=1 total affected potential mitigated notaffected unknown apps
-
-    total=$(total_count)
-    affected=$(status_count affected)
-    potential=$(status_count potential)
-    mitigated=$(status_count mitigated)
-    notaffected=$(status_count not_affected)
-    unknown=$(status_count unknown)
-    apps=$(apps_count)
-
-    printf '{\n'
-    printf '  "cve": %s,\n' "$(jstr "$CVE")"
-    printf '  "nickname": %s,\n' "$(jstr "$NICKNAME")"
-    printf '  "rules_as_of": %s,\n' "$(jstr "$RULES_AS_OF")"
-    printf '  "mode": %s,\n' "$(jstr "$MODE_NAME")"
-    printf '  "summary": {"total": %s, "by_status": {"affected": %s, "potential": %s, "mitigated": %s, "not_affected": %s, "unknown": %s}},\n' \
-        "${total:-0}" "${affected:-0}" "${potential:-0}" "${mitigated:-0}" "${notaffected:-0}" "${unknown:-0}"
-    printf '  "cpu": {"arch": %s, "state": %s, "required_features": %s, "counts": %s, "source": %s},\n' \
-        "$(jstr "$ARCH_RAW")" "$(jstr "$CPU_STATE")" "$(jstr "$REQ_FEATURES")" "$(jstr "$CPU_COUNTS")" "$(jstr "$CPU_SOURCE")"
-
-    printf '  "coverage": {"root_max_depth": %s, "root_depth_boundaries": %s, "root_scan_errors": %s, "unreadable_process_maps": %s},\n'         "$((10#$ROOT_DEPTH))" "$ROOT_DEPTH_BOUNDARIES" "$ROOT_SCAN_ERRORS" "$LIMITED_PROCS"
-
-    printf '  "warnings": ['
-    first=1
-    while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        [ "$first" -eq 1 ] || printf ','
-        first=0
-        printf '%s' "$(jstr "$id")"
-    done < "$WARN_FILE"
-    printf '],\n'
-
-    printf '  "findings": [\n'
-    first=1
-    while IFS=$'\037' read -r id kind status reason build bevid cpu version jhome vendor product vm arch flags feff container notes identity_confidence disk_hint_version disk_hint_vendor disk_hint_product disk_hint_build; do
-        [ -n "$id" ] || continue
-        [ "$first" -eq 1 ] || printf ',\n'
-        first=0
-        printf '    {"id": %s, "kind": %s, "status": %s, "reason": %s, ' \
-            "$(jstr "$id")" "$(jstr "$kind")" "$(jstr "$status")" "$(jstr "$reason")"
-        printf '"build_assessment": %s, "build_evidence": %s, "cpu_assessment": %s, ' \
-            "$(jstr "$build")" "$(jstr "$bevid")" "$(jstr "$cpu")"
-        printf '"version": %s, "java_home": %s, "vendor": %s, "product": %s, "vm": %s, "arch": %s, ' \
-            "$(jstr "$version")" "$(jstr "$jhome")" "$(jstr "$vendor")" "$(jstr "$product")" "$(jstr "$vm")" "$(jstr "$arch")"
-        printf '"flags": %s, "flags_effective": %s, "container": %s, "notes": %s' \
-            "$(jstr "$flags")" "${feff:-false}" "$(jstr "$container")" "$(json_notes "$notes")"
-        case $reason in
-            按显式信任*) printf ', "flags_evidence_source": "startup_arguments_estimated"' ;;
-            *) if [ "$kind" = process ] && [ "$feff" = true ]; then printf ', "flags_evidence_source": "jcmd"'; fi ;;
-        esac
-        if [ -n "$identity_confidence" ]; then
-            printf ', "identity_confidence": %s' "$(jstr "$identity_confidence")"
-        fi
-        if [ -n "$disk_hint_build" ]; then
-            printf ', "disk_evidence": {"version": %s, "vendor": %s, "product": %s, "build_assessment": %s}' \
-                "$(jstr "$disk_hint_version")" "$(jstr "$disk_hint_vendor")" \
-                "$(jstr "$disk_hint_product")" "$(jstr "$disk_hint_build")"
-        fi
-        printf '}'
-    done < "$FIND_FILE"
-    printf '\n  ],\n'
-
-    printf '  "apps": [\n'
-    first=1
-    while IFS=$'\037' read -r id kind path; do
-        [ -n "$id" ] || continue
-        [ "$first" -eq 1 ] || printf ',\n'
-        first=0
-        printf '    {"name": %s, "exposure": %s, "path": %s}' "$(jstr "$id")" "$(jstr "$kind")" "$(jstr "$path")"
-    done < "$APP_FILE"
-    printf '\n  ]\n'
-    printf '}\n'
-}
-
-csv_field() {
-    local v=${1:-}
-    case $v in
-        [=+@-]*) v="'$v" ;;
-    esac
-    v=${v//\"/\"\"}
-    printf '"%s"' "$v"
-}
-
-csv_line() {
-    local out="" sep="" f
-    for f in "$@"; do
-        out="$out$sep$(csv_field "$f")"
-        sep=","
-    done
-    printf '%s' "$out"
-}
-
-report_csv() {
-    local id kind status reason build bevid cpu version jhome vendor product vm arch flags feff container notes identity_confidence disk_hint_version disk_hint_vendor disk_hint_product disk_hint_build
-    printf '%s\n' "cve,rules_as_of,mode,id,kind,status,reason,build_assessment,build_evidence,cpu_assessment,version,java_home,vendor,product,vm,arch,cpu_state,cpu_source,patch,patch_ref,flags,flags_effective,container,notes,identity_confidence,disk_version,disk_vendor,disk_product,disk_build_assessment"
-    while IFS=$'\037' read -r id kind status reason build bevid cpu version jhome vendor product vm arch flags feff container notes identity_confidence disk_hint_version disk_hint_vendor disk_hint_product disk_hint_build; do
-        [ -n "$id" ] || continue
-        csv_line "$CVE" "$RULES_AS_OF" "$MODE_NAME" "$id" "$kind" "$status" "$reason" \
-            "$build" "$bevid" "$cpu" "$version" "$jhome" "$vendor" "$product" "$vm" "$arch" \
-            "$CPU_STATE" "$CPU_SOURCE" "" "" "$flags" "$feff" "$container" "$notes" \
-            "$identity_confidence" "$disk_hint_version" "$disk_hint_vendor" "$disk_hint_product" "$disk_hint_build"
-        printf '\n'
-    done < "$FIND_FILE"
-}
-
-report_apps_csv() {
-    local id kind path
-    while IFS=$'\037' read -r id kind path; do
-        [ -n "$id" ] || continue
-        csv_line "$CVE" "$RULES_AS_OF" "$MODE_NAME" "$path" "app" "inventory" "$kind" "-" "-" "-" "" "$path" "" "" "" "" "$CPU_STATE" "$CPU_SOURCE" "" "" "" "false" "" "$id" "" "" "" "" ""
-        printf '\n'
-    done < "$APP_FILE"
+jstr() {
+    local escaped
+    # A trailing marker lets awk preserve any final newline in the original value.
+    escaped=$(json_escape "${1:-}.")
+    printf '"%s"' "${escaped%.}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1903,54 +1569,33 @@ parse_args() {
         case $1 in
             -h|--help)    usage; exit 0 ;;
             -V|--version) printf '%s %s\n' "$PROG" "$SCRIPT_VERSION"; exit 0 ;;
-            --jdk)        [ $# -ge 2 ] || die "--jdk 需要一个路径"; JDK_ARGS[${#JDK_ARGS[@]}]=$2; shift 2 ;;
-            --pid)        [ $# -ge 2 ] || die "--pid 需要一个进程号"
-                          case $2 in ''|*[!0-9]*) die "--pid 需要正整数: $2" ;; esac
+            --pid)        [ $# -ge 2 ] || die "--pid requires a process ID."
+                          case $2 in ''|*[!0-9]*) die "--pid requires a positive integer." ;; esac
                           PID_ARGS[${#PID_ARGS[@]}]=$2; shift 2 ;;
-            --java-path)  [ $# -ge 2 ] || die "--java-path 需要一个路径"; JAVA_BINS[${#JAVA_BINS[@]}]=$2; shift 2 ;;
-            --cpuinfo)    [ $# -ge 2 ] || die "--cpuinfo 需要一个路径"; CPUINFO=$2; shift 2 ;;
-            --apps)       [ $# -ge 2 ] || die "--apps 需要一个目录"; APPS_DIR=$2; shift 2 ;;
-            --apps-depth) [ $# -ge 2 ] || die "--apps-depth 需要数字"
-                          case $2 in ''|*[!0-9]*) die "--apps-depth 需要正整数: $2" ;; esac
-                          APPS_DEPTH=$2; shift 2 ;;
-            --format)     [ $# -ge 2 ] || die "--format 需要 txt/json/csv"
-                          case $2 in txt|json|csv) FORMAT=$2 ;; *) die "未知格式: $2" ;; esac
-                          shift 2 ;;
-            --json)       FORMAT=json; shift ;;
-            --csv)        FORMAT=csv; shift ;;
-            --out)        [ $# -ge 2 ] || die "--out 需要一个文件路径"; OUT=$2; shift 2 ;;
-            --fail-on)    [ $# -ge 2 ] || die "--fail-on 需要一个状态列表"; FAIL_ON=$2; shift 2 ;;
-            --assume-flags-effective) ASSUME_FEFF=1; shift ;;
-            --root)       [ $# -ge 2 ] || die "--root 需要一个目录"; ROOT_ARGS[${#ROOT_ARGS[@]}]=$2; shift 2 ;;
-            --root-depth) [ $# -ge 2 ] || die "--root-depth 需要数字"
-                          case $2 in ''|*[!0-9]*) die "--root-depth 需要正整数: $2" ;; esac
+            --json)       shift ;;
+            --root)       [ $# -ge 2 ] || die "--root requires a directory."
+                          ROOT_ARGS[${#ROOT_ARGS[@]}]=$2; shift 2 ;;
+            --root-depth) [ $# -ge 2 ] || die "--root-depth requires a number."
+                          case $2 in ''|*[!0-9]*) die "--root-depth requires a non-negative integer." ;; esac
                           ROOT_DEPTH=$2; shift 2 ;;
             --jcmd)       JCMD=1; shift ;;
             --processes-only) PROC_ONLY=1; shift ;;
             --no-processes)   NO_PROC=1; shift ;;
-            --details)    DETAILS=1; shift ;;
-            --demo)       DEMO=1; shift ;;
-            --quiet)      QUIET=1; shift ;;
-            --)           shift; break ;;
-            -*)           die "未知参数: $1（用 --help 查看用法）" ;;
-            *)            die "多余的参数: $1" ;;
+            --)           shift
+                          [ "$#" -eq 0 ] || die "Unexpected argument after --. See --help."
+                          break ;;
+            -*)           die "Unknown Java option. See --help." ;;
+            *)            die "Unexpected Java argument. See --help." ;;
         esac
     done
 
     if [ "$PROC_ONLY" -eq 1 ] && [ "$NO_PROC" -eq 1 ]; then
-        die "--processes-only 与 --no-processes 不能同时使用"
-    fi
-    if [ "$PROC_ONLY" -eq 1 ] && [ ${#JDK_ARGS[@]} -gt 0 ]; then
-        die "--processes-only 与 --jdk 不能同时使用"
+        die "Use either --processes-only or --no-processes."
     fi
     if [ "$PROC_ONLY" -eq 1 ] && [ ${#ROOT_ARGS[@]} -gt 0 ]; then
-        die "--processes-only 与 --root 不能同时使用"
+        die "Use --root without --processes-only."
     fi
 
-    local status_pattern='(affected|potential|mitigated|not_affected|unknown)'
-    local failure_pattern="^${status_pattern}(,${status_pattern})*$"
-    [[ $FAIL_ON =~ $failure_pattern ]] ||
-        die "--fail-on 只接受 affected,potential,mitigated,not_affected,unknown"
 }
 
 cleanup() {
@@ -1961,6 +1606,10 @@ cleanup() {
 # 主流程
 # ---------------------------------------------------------------------------
 # Nginx2Root mode reuses the report format helpers and only reads local files.
+NGINX_SITE_CONFIG=/apps/svr/nginx/conf/nginx.conf
+NGINX_CONFIG_DIRECTORY_LIMIT=4096
+NGINX_CONFIG_GLOB_LIMIT=128
+
 nginx_config_evidence() {
     local config=$1 key comma=
     shift
@@ -1973,78 +1622,94 @@ nginx_config_evidence() {
     printf ']'
 }
 
-nginx_plus_reference() {
+nginx_plus_result() {
     local version=$1 cve=${2:-}
-    [[ $version =~ ^[0-9]+([.][0-9]+){0,3}(-p[0-9]+)?$ ]] || { printf unknown; return; }
+    [[ $version =~ ^[0-9]+([.][0-9]+){0,3}(-p[0-9]+)?$ ]] || { printf pending; return; }
     version=${version%%-p*}
     case $version in
-        37.0.8.1|37.3.0.1) printf meets_vendor_reference; return ;;
+        37.0.8.1|37.3.0.1) printf no_risk; return ;;
         37.0.7.1|37.2.0.1)
-            if [[ $cve == CVE-2026-123633 ]]; then printf meets_vendor_reference; return; fi ;;
+            if [[ $cve == CVE-2026-123633 ]]; then printf no_risk; return; fi ;;
     esac
     case $version in
-        34|34.*|35|35.*|36|36.*|37) printf potential; return ;;
+        34|34.*|35|35.*|36|36.*|37) printf risk; return ;;
         37.*)
             if { vge "$version" 37.0.0 && vle "$version" 37.0.7.1; } ||
                { vge "$version" 37.1.0 && vle "$version" 37.2.0.1; }; then
-                printf potential; return
+                printf risk; return
             fi ;;
     esac
-    printf unknown
+    printf pending
 }
 
-nginx2root_reference() {
-    local raw=$1 config=${2:-} flavor=${3:-nginx} plus=${4:-} cve minimum feature status missing evidence upstream extra comma=
+nginx2root_cves() {
+    local raw=$1 config=${2:-} flavor=${3:-nginx} plus=${4:-} version_source=${5:-}
+    local cve minimum feature version_result result result_reason missing evidence version_range_match comma=
     printf '['
     while read -r cve minimum feature; do
-        status=unknown
+        version_result=pending
         if [[ $flavor == plus ]]; then
-            status=$(nginx_plus_reference "$plus" "$cve")
+            version_result=$(nginx_plus_result "$plus" "$cve")
         elif { [[ $raw == 1.30.* ]] && vge "$raw" 1.30.7; } ||
            { [[ $raw =~ ^1\.[0-9]+\.[0-9]+$ ]] && vge "$raw" 1.31.9; }; then
-            status=meets_upstream_reference
+            version_result=no_risk
         elif [ -n "$raw" ]; then
-            if vlt "$raw" "$minimum"; then status=outside_upstream_range
-            elif vle "$raw" 1.31.8; then status=potential
+            if vlt "$raw" "$minimum"; then version_result=no_risk
+            elif vle "$raw" 1.31.8; then version_result=risk
             fi
         fi
-        extra=
         if [[ $flavor != nginx && $flavor != plus ]]; then
-            upstream=$status
-            [[ $status == potential && ( $flavor == openresty || $flavor == tengine ) ]] || status=unknown
-            extra=",\"embedded_upstream_status\":\"$upstream\""
+            [[ $version_result == risk && ( $flavor == openresty || $flavor == tengine ) ]] || version_result=pending
         fi
         case $feature in
             http2) missing=$(nginx_config_evidence "$config" http2_on) ;;
             http2_upstream) missing=$(nginx_config_evidence "$config" http2_on upstream) ;;
-            http3_upstream) missing=$(nginx_config_evidence "$config" http3_or_quic upstream) ;;
-            resolver_proxy_mirror) missing=$(nginx_config_evidence "$config" resolver dynamic_proxy_pass mirror mirror_request_body_off) ;;
-            mail_proxy_auth_http) missing=$(nginx_config_evidence "$config" mail_proxy auth_http) ;;
+            http3_upstream) missing=$(nginx_config_evidence "$config" quic_listener) ;;
+            resolver_proxy_mirror)
+                if [[ $config == *'"ssi":true'* ]]; then
+                    missing=$(nginx_config_evidence "$config" resolver dynamic_proxy_host)
+                else
+                    missing=$(nginx_config_evidence "$config" resolver dynamic_proxy_host mirror)
+                fi ;;
+            mail_proxy_auth_http) missing=$(nginx_config_evidence "$config" mail) ;;
         esac
         evidence=condition_not_observed
         [[ $missing != '[]' ]] || evidence=disk_hints_present
-        if [[ -z $config || $config == *'"files_examined":0,'* ]]; then
+        if [[ -z $config ]]; then
             evidence=configuration_not_attributed
             missing='[]'
-        elif [[ $config =~ \"skipped\":[1-9] ]]; then
+        elif [[ $config =~ \"skipped\":[1-9] && ( $missing != '[]' || $config == *'"files_examined":0,'* ) ]]; then
             evidence=configuration_incomplete
             missing='[]'
+        elif [[ $config == *'"files_examined":0,'* ]]; then
+            evidence=configuration_not_attributed
+            missing='[]'
         fi
-        extra="$extra,\"reference\":\"https://www.cve.org/CVERecord?id=$cve\",\"upstream_advisory\":\"https://nginx.org/en/security_advisories.html\",\"upstream_fixed_versions\":[\"1.30.7\",\"1.31.9\"]"
-        if [[ $flavor == plus ]]; then
-            local vendor_versions='["37.0.8.1","37.3.0.1"]' advisory
-            case $cve in
-                CVE-2026-123007) advisory=K000163926 ;;
-                CVE-2026-123633) advisory=K000163928 ;;
-                CVE-2026-123634) advisory=K000163925 ;;
-                CVE-2026-121810) advisory=K000163927 ;;
-                CVE-2026-113425) advisory=K000163931 ;;
-            esac
-            if [[ $cve == CVE-2026-123633 ]]; then vendor_versions='["37.0.7.1","37.2.0.1"]'; fi
-            extra="$extra,\"vendor_reference\":\"https://docs.nginx.com/nginx/releases/\",\"vendor_fixed_versions\":$vendor_versions,\"vendor_advisory\":\"https://my.f5.com/manage/s/article/$advisory\""
+        case $version_result in
+            risk) version_range_match=true ;;
+            no_risk) version_range_match=false ;;
+            *) version_range_match=null ;;
+        esac
+        result=pending
+        if [[ $evidence == configuration_incomplete ]]; then
+            result_reason=$evidence
+        elif [[ $version_range_match == false && $version_source != disk ]]; then
+            result=no_risk
+            result_reason=version_outside_range
+        elif [[ $evidence == configuration_not_attributed ]]; then
+            result_reason=$evidence
+        elif [[ $version_range_match == null ]]; then
+            result_reason=version_match_unknown
+        elif [[ $version_range_match == true && $evidence == disk_hints_present ]]; then
+            result=risk
+            result_reason=risk_gate_hit
+        elif [[ $version_range_match == true ]]; then
+            result_reason=condition_not_observed
+        else
+            result_reason=runtime_version_unverified
         fi
-        printf '%s{"cve":"%s","status":"%s","feature":"%s","config_evidence":"%s","missing_disk_hints":%s%s}' \
-            "$comma" "$cve" "$status" "$feature" "$evidence" "$missing" "$extra"
+        printf '%s{"cve":"%s","result":"%s","result_reason":"%s","feature":"%s","config_evidence":"%s","version_range_match":%s}' \
+            "$comma" "$cve" "$result" "$result_reason" "$feature" "$evidence" "$version_range_match"
         comma=,
     done <<'RULES'
 CVE-2026-123007 1.9.5 http2
@@ -2057,12 +1722,15 @@ RULES
 }
 
 nginx2root_binary_metadata() {
-    local file=$1 marks versions plus flavor=nginx module comma= product=
+    local file=$1 marks versions plus flavor=nginx module comma= product= compiled_config
     local hints=''
     [[ -f "$file" && $(head -c 4 -- "$file" 2>/dev/null) == $'\x7fELF' ]] || return 0
     marks=$(head -c 16777216 -- "$file" 2>/dev/null |
-        LC_ALL=C grep -aiEo 'nginx/[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,5}\b|nginx-plus(-r[0-9]+([.][0-9]+){0,3}(-p[0-9]+)?)?|(Tengine|openresty)(/[0-9]+([.][0-9]+){1,3}(-rc[0-9]+)?)?|--with-http_v[23]_module|--with-mail(=dynamic)?|ngx_http_v[23]_module|ngx_http_mirror_module|ngx_mail_proxy_module' |
-        LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sort -u)
+        LC_ALL=C grep -aiEo 'nginx/[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,5}\b|nginx-plus(-r[0-9]+([.][0-9]+){0,3}(-p[0-9]+)?)?|(Tengine|openresty)(/[0-9]+([.][0-9]+)+(-rc[0-9]+)?)?|--with-http_v[23]_module|--with-mail(=dynamic)?|ngx_http_v[23]_module|ngx_http_mirror_module|ngx_mail_proxy_module|--conf-path=/[a-zA-Z0-9/._-]+' |
+        LC_ALL=C sort -u)
+    compiled_config=$(sed -n 's|^--conf-path=||p' <<< "$marks")
+    [[ $compiled_config != *$'\n'* ]] || compiled_config=ambiguous
+    marks=$(sed '/^--conf-path=/d' <<< "$marks" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sort -u)
     versions=$(sed -n 's|^nginx/||p' <<< "$marks")
     plus=$(sed -n 's|^nginx-plus-r||p' <<< "$marks")
     [[ $versions != *$'\n'* ]] || versions=
@@ -2086,7 +1754,78 @@ nginx2root_binary_metadata() {
         product=$(sed -n "s|^$flavor/||p" <<< "$marks")
         [[ $product != *$'\n'* ]] || product=
     fi
-    printf '%s|%s|%s|[%s]|%s' "$versions" "$flavor" "$plus" "$hints" "$product"
+    printf '%s|%s|%s|[%s]|%s|%s' "$versions" "$flavor" "$plus" "$hints" "$product" "$compiled_config"
+}
+
+nginx_process() {
+    local proc=$1 name
+    if ! IFS= read -r name 2>/dev/null < "$proc/comm"; then
+        if [[ -d $proc ]]; then return 2; fi
+        return 1
+    fi
+    case $name in nginx|nginx-debug|openresty|tengine) return 0 ;; *) return 1 ;; esac
+}
+
+nginx_process_role() {
+    local proc=$1 title
+    if ! IFS= read -r -d '' -n 48 title 2>/dev/null < "$proc/cmdline" || [[ -z $title ]]; then
+        printf unknown
+        return
+    fi
+    case $title in
+        *': master process'|*': master process '*) printf master ;;
+        *': worker process'|*': worker process '*) printf worker ;;
+        *': cache manager process'*|*': cache loader process'*) printf auxiliary ;;
+        *) printf standalone ;;
+    esac
+}
+
+# Worker titles replace the original arguments. Use the parent's arguments
+# only when both processes refer to the same image, filesystem and namespace.
+nginx_worker_parent() {
+    local proc=$1 id=$2 root=$3 namespace=$4 ppid parent
+    [[ -n $id && -n $root && -n $namespace ]] || return 1
+    ppid=$(awk '$1 == "PPid:" {print $2; exit}' "$proc/status" 2>/dev/null)
+    [[ $ppid =~ ^[1-9][0-9]*$ ]] || return 1
+    parent=${proc%/*}/$ppid
+    nginx_process "$parent" && [[ $(nginx_process_role "$parent") == master ]] || return 1
+    [[ $(file_id "$parent/exe") == "$id" && $(file_id "$parent/root") == "$root" &&
+       $(readlink "$parent/ns/mnt" 2>/dev/null) == "$namespace" ]] || return 1
+    printf '%s' "$parent"
+}
+
+nginx_master_binary_hint() {
+    local proc=$1 title binary LC_ALL=C
+    IFS= read -r -d '' -n 4097 title 2>/dev/null < "$proc/cmdline" || return 1
+    [[ ${#title} -le 4096 && $title == *': master process '* ]] || return 1
+    read -r binary _ <<< "${title#*: master process }"
+    if [[ $binary == /* ]]; then
+        [[ $binary =~ ^/[a-zA-Z0-9/._-]+$ && -f $binary && -r $binary ]] || return 1
+    else
+        binary=${binary#./}
+        [[ $binary != */* ]] || return 1
+    fi
+    case ${binary##*/} in
+        nginx|nginx-debug|openresty|tengine) printf '%s' "$binary" ;;
+        *) return 1 ;;
+    esac
+}
+
+nginx_unique_local_binary() {
+    local command=$1 candidate candidate_id unique_id= chosen=
+    shift
+    for candidate in "$@"; do
+        [[ -n $candidate && -f $candidate ]] || continue
+        [[ $candidate == /* ]] || candidate=$PWD/$candidate
+        candidate_id=$(file_id "$candidate") || return 1
+        [[ -z $unique_id || $candidate_id == "$unique_id" ]] || return 1
+        unique_id=$candidate_id
+        if [[ -z $chosen && ${candidate##*/} == "$command" && -r $candidate && -x $candidate ]]; then
+            chosen=$candidate
+        fi
+    done
+    [[ -n $chosen ]] || return 1
+    printf '%s' "$chosen"
 }
 
 # Parse only unambiguous absolute -c arguments from the visible process.
@@ -2097,16 +1836,17 @@ nginx_process_config_entry() {
         BEGIN {RS="\0"}
         {size+=length($0)+1; args[NR]=$0}
         END {
-            if (NR<=1) exit
+            if (NR<=1 || (args[1] ~ /: master process( |$)/ && args[2]=="")) exit
             print "argv"
             if (size>4096) exit
             for(i=2;i<=NR;i++) {
                 if(args[i]=="") break
                 if(args[i]=="-g") {i++; continue}
-                if(args[i]=="-c") {
-                    if(path!="" || args[i+1]!~/^\/[[:alnum:]\/._-]+$/ ||
-                       (args[i+2]!="" && args[i+2]!~/^-/)) exit
-                    path=args[++i]
+                if (args[i]=="-c" || args[i] ~ /^-c\//) {
+                    candidate=(args[i]=="-c" ? args[++i] : substr(args[i],3))
+                    if (path!="" || candidate!~/^\/[[:alnum:]\/._-]+$/ ||
+                        (args[i+1]!="" && args[i+1]!~/^-/)) exit
+                    path=candidate
                 }
             }
             if(path!="") print path
@@ -2121,11 +1861,15 @@ nginx_process_config_entry() {
             if (length(text)>4097) exit
             count=split(text,words,/[[:space:]]+/)
             for(i=1;i<=count;i++) {
-                if(words[i]=="-g") break
-                if(words[i]=="-c") {
-                    if(path!="" || words[i+1]!~/^\/[[:alnum:]\/._-]+$/ ||
-                       (words[i+2]!="" && words[i+2]!~/^-/)) exit
-                    path=words[++i]
+                if (words[i]=="-g") {
+                    if (words[i+1]=="daemon" && words[i+2]=="off;") {i+=2; continue}
+                    break
+                }
+                if (words[i]=="-c" || words[i] ~ /^-c\//) {
+                    candidate=(words[i]=="-c" ? words[++i] : substr(words[i],3))
+                    if (path!="" || candidate!~/^\/[[:alnum:]\/._-]+$/ ||
+                        (words[i+1]!="" && words[i+1]!~/^-/)) exit
+                    path=candidate
                 }
             }
             if(path!="") print path
@@ -2145,117 +1889,400 @@ nginx_layout_config() {
     fi
 }
 
+nginx_site_config_entry() {
+    local proc=$1 binary=$2 flavor=$3 layout_config
+    local config=$NGINX_SITE_CONFIG prefix=${NGINX_SITE_CONFIG%/conf/nginx.conf}
+    [[ -f $config ]] || return 1
+
+    layout_config=$(nginx_layout_config "$binary" "$flavor")
+    if [[ -n $layout_config ]]; then
+        [[ $config -ef $layout_config ]] || return 1
+        # 文件软链接的两端可能位于不同目录，按安装路径解析相对 include。
+        [[ ${config%/*} -ef ${layout_config%/*} ]] || config=$layout_config
+    elif [[ ! $binary -ef "$prefix/sbin/nginx" && ! $binary -ef "$prefix/bin/nginx" ]]; then
+        return 1
+    fi
+
+    nginx_process_uses_default_config "$proc" || return 1
+    printf '%s' "$config"
+}
+
+# 存在无法解析的 -c 或 -p 时，保留配置归属未知。
+nginx_process_uses_default_config() {
+    head -c 4097 -- "$1/cmdline" 2>/dev/null | LC_ALL=C awk '
+        BEGIN { RS="\0" }
+        { size += length($0) + 1 }
+        /(^|[[:space:]])-[^[:space:]]*[cp]/ { overridden=1 }
+        END { exit !(size > 0 && size <= 4096 && !overridden) }
+    '
+}
+
+nginx_config_directives() {
+    LC_ALL=C awk '
+        function token() {
+            if (!in_word) return
+            args[++argc] = word
+            word = ""
+            in_word = 0
+        }
+        function hint(key) {
+            printf "@hint %d %s\n", line, key
+        }
+        function problem(reason, location) {
+            printf "@problem %d %s\n", location, reason
+        }
+        # Lua has its own strings, comments, and table delimiters.
+        # Share the cursor so NGINX parsing resumes after the closing brace.
+        function lua_character(text, c,    opener, width, comment) {
+            if (lua_long_end != "") {
+                width = length(lua_long_end)
+                if (c == "]" && substr(text, i, width) == lua_long_end) {
+                    i += width - 1
+                    lua_long_end = ""
+                }
+            } else if (lua_quote != "") {
+                if (c == "\\") i++
+                else if (c == lua_quote) lua_quote = ""
+            } else if (c == "\"" || c == "\047") {
+                lua_quote = c
+            } else if (c == "[" || (c == "-" && substr(text, i, 2) == "--")) {
+                comment = c == "-" ? 2 : 0
+                if (match(substr(text, i + comment), /^\[=*\[/)) {
+                    width = RLENGTH
+                    opener = substr(text, i + comment, width)
+                    lua_long_end = "]" substr(opener, 2, width - 2) "]"
+                    i += comment + width - 1
+                } else if (comment) {
+                    return 1
+                }
+            } else if (c == "{") {
+                lua_depth++
+            } else if (c == "}") {
+                lua_depth--
+            }
+            return 0
+        }
+        function directive(end,    name, value, host, i) {
+            token()
+            name = argc ? args[1] : ""
+            value = argc > 1 ? args[2] : ""
+            if (end == "{") {
+                if (name ~ /^(init|init_worker|exit_worker|set|server_rewrite|rewrite|access|content|balancer|header_filter|body_filter|log|preread|ssl_client_hello|ssl_certificate|ssl_session_fetch|ssl_session_store)_by_lua_block$/) {
+                    lua_depth = 1
+                    lua_start = line
+                } else {
+                    depth++
+                    if (name == "mail") hint("mail")
+                    if (!argc && !bad_line) bad_line = NR
+                }
+            } else if (end == "}") {
+                if ((--depth < 0 || argc) && !bad_line) bad_line = NR
+            } else if (name == "include") {
+                hint("include_observed")
+                if (argc == 2 && value != "" && value !~ /[[:cntrl:]]/) print "@include " value
+                else problem("unsupported_include", line)
+            } else if (name == "listen") {
+                for (i = 3; i <= argc; i++) {
+                    if (args[i] == "http2") hint("http2_on")
+                    if (args[i] == "quic") {
+                        hint("http3_or_quic")
+                        hint("quic_listener")
+                    }
+                }
+            } else if (name == "http2" && value ~ /^(on|off)$/) hint("http2_" value)
+            else if (name == "http3" && value == "on") hint("http3_or_quic")
+            else if (name == "proxy_http_version" && value == "2") hint("proxy_http_version_2")
+            else if (name == "resolver" && value != "off") hint("resolver")
+            else if (name == "mirror" && value != "off") hint("mirror")
+            else if (name == "mirror_request_body" && value == "off") hint("mirror_request_body_off")
+            else if (name == "ssi" && value == "on") hint("ssi")
+            else if (name == "proxy" && value == "on") hint("mail_proxy")
+            else if (name == "auth_http") hint("auth_http")
+            else if (name ~ /^(proxy|grpc|fastcgi|uwsgi|scgi|memcached)_pass$/) {
+                hint("upstream")
+                if (name == "grpc_pass") hint("grpc_upstream")
+                if (name == "proxy_pass" && index(value, "$")) {
+                    hint("dynamic_proxy_pass")
+                    host = value
+                    if (sub(/^https?:\/\//, "", host)) sub(/[:\/?].*$/, "", host)
+                    if (index(host, "$")) hint("dynamic_proxy_host")
+                }
+            }
+            argc = line = 0
+        }
+        {
+            for (i = 1; i <= length($0); i++) {
+                c = substr($0, i, 1)
+                if (lua_depth) {
+                    if (lua_character($0, c)) break
+                    continue
+                }
+                if (escaped) {
+                    word = word c
+                    escaped = 0
+                } else if (c == "\\") {
+                    escaped = in_word = 1
+                    if (!line) line = NR
+                } else if (quote) {
+                    if (c == quote) quote = ""
+                    else word = word c
+                } else if (variable) {
+                    word = word c
+                    if (c == "}") variable = 0
+                } else if (c == "#" && !in_word) {
+                    break
+                } else if (c ~ /[[:space:]]/) {
+                    token()
+                } else if (c == "{" && word ~ /\$$/) {
+                    word = word c
+                    variable = 1
+                } else if (c == ";" || c == "{" || c == "}") {
+                    directive(c)
+                } else {
+                    if (!line) line = NR
+                    in_word = 1
+                    if (c == "\"" || c == "\047") quote = c
+                    else word = word c
+                }
+            }
+            if (quote) word = word "\n"
+            else if (!escaped && !variable) token()
+        }
+        END {
+            if (lua_depth)
+                problem("unsupported_syntax", lua_start)
+            else if (bad_line || depth || argc || in_word || quote || escaped || variable)
+                problem("unsupported_syntax", bad_line ? bad_line : (line ? line : NR))
+        }
+    '
+}
+
+nginx_config_root_path() {
+    local root=$1 rest=$2 directory=${3:-} resolved= part candidate target links=0
+    [[ $rest == /* ]] || return 1
+    while [[ -n $rest ]]; do
+        part=${rest%%/*}
+        if [[ $rest == */* ]]; then rest=${rest#*/}; else rest=; fi
+        case $part in
+            ''|.) continue ;;
+            ..) resolved=${resolved%/*}; continue ;;
+        esac
+        candidate=$root$resolved/$part
+        if [[ -L $candidate ]]; then
+            ((links < 40)) || return 1
+            links=$((links + 1))
+            target=$(readlink -- "$candidate" 2>/dev/null) || return 1
+            # 容器中的绝对软链接从容器根目录解析。
+            [[ $target != /* ]] || resolved=
+            rest=$target${rest:+/$rest}
+        else
+            if [[ ( -n $rest || $directory == directory ) && ! -d $candidate ]]; then
+                if [[ -x $root$resolved/ && ! -e $candidate ]]; then return 2; fi
+                return 1
+            fi
+            resolved+=/$part
+        fi
+    done
+    printf '%s' "$root${resolved:-/}"
+}
+
+nginx_config_skip() {
+    local reason=$1 path=$2 line=${3:-}
+    printf '@skipped {"reason":"%s","file":%s' "$reason" "$(jstr "$(san_field "$path")")"
+    [[ -z $line ]] || printf ',"line":%d' "$line"
+    printf '}\n'
+}
+
+nginx_config_directory_entries() {
+    # Read incrementally. An empty record marks EOF before the requested limit.
+    if [[ $1 == perl ]]; then
+        perl -e '
+            my ($path, $remaining) = @ARGV;
+            binmode(STDOUT, ":raw");
+            opendir(my $dir, $path) or exit 1;
+            while ($remaining > 0) {
+                $! = 0;
+                my $name = readdir($dir);
+                if (!defined $name) {
+                    exit 1 if $!;
+                    print "\0";
+                    last;
+                }
+                next if $name eq "." || $name eq "..";
+                print $name, "\0";
+                $remaining--;
+            }
+            closedir($dir);
+        ' -- "$2" "$3"
+    else
+        python3 -c '
+import os
+import sys
+
+with os.scandir(os.fsencode(sys.argv[1])) as entries:
+    for _ in range(int(sys.argv[2])):
+        entry = next(entries, None)
+        if entry is None:
+            sys.stdout.buffer.write(b"\0")
+            break
+        sys.stdout.buffer.write(entry.name + b"\0")
+        ' "$2" "$3"
+    fi
+}
+
+nginx_config_glob() {
+    local target=$1 base=$2 depth=$3 dir=${1%/*} pattern=${1##*/} fs_dir status=0 name complete=false
+    local -a matches=()
+    [[ $glob_budget_reached == false ]] || return 0
+    if ((directory_entries_examined >= directory_limit)); then
+        glob_budget_reached=true
+        nginx_config_skip directory_entry_limit "$target"
+        return 0
+    fi
+    if ((glob_expansions >= glob_limit)); then
+        glob_budget_reached=true
+        nginx_config_skip glob_expansion_limit "$target"
+        return 0
+    fi
+    glob_expansions=$((glob_expansions + 1))
+    if [[ $dir == *[\*\?\[]* ]]; then
+        nginx_config_skip unsupported_glob_directory "$target"
+        return 0
+    fi
+    fs_dir=${dir:-/}
+    [[ $fs_dir == /* ]] || fs_dir=$PWD/$fs_dir
+    fs_dir=$(nginx_config_root_path "$config_root" "$fs_dir" directory) || status=$?
+    # Nginx accepts a wildcard include with no matches, including an absent directory.
+    [[ $status -ne 2 ]] || return 0
+    if [[ $status -ne 0 || ! -r $fs_dir || ! -x $fs_dir ]]; then
+        nginx_config_skip include_directory_unreadable "$target"
+        return 0
+    fi
+    if [[ -z $directory_reader ]]; then
+        nginx_config_skip include_directory_reader_unavailable "$target"
+        return 0
+    fi
+    # One extra entry distinguishes a full directory from a truncated enumeration.
+    while LC_ALL=C IFS= read -r -d '' name; do
+        if [[ -z $name ]]; then complete=true; break; fi
+        if ((directory_entries_examined >= directory_limit)); then
+            glob_budget_reached=true
+            nginx_config_skip directory_entry_limit "$target"
+            break
+        fi
+        directory_entries_examined=$((directory_entries_examined + 1))
+        if [[ $name == $pattern && ( $name != .* || $pattern == .* ) ]]; then matches+=("$name"); fi
+    done < <(nginx_config_directory_entries "$directory_reader" "$fs_dir" "$((directory_limit - directory_entries_examined + 1))" 2>/dev/null)
+    if [[ $complete == false && $glob_budget_reached == false ]]; then
+        nginx_config_skip include_directory_read_failed "$target"
+    fi
+    if [[ -n ${matches[0]:-} ]]; then
+        while LC_ALL=C IFS= read -r -d '' name; do
+            nginx_config_stream "$dir/$name" "$base" "$depth" || break
+        done < <(printf '%s\0' "${matches[@]}" | sort -z)
+    fi
+}
+
 nginx_config_stream() {
-    local path=$1 base=$2 depth=$3 id size content target dir suffix match has_match
-    if [ "$count" -ge 64 ]; then printf '@skipped\n'; return; fi
-    if [ ! -f "$path" ]; then
-        if [ "$depth" -gt 0 ] || [ "$explicit_roots" -eq 1 ]; then printf '@skipped\n'; fi
+    local path=$1 base=$2 depth=$3 id size content entry target fs_path problem_line reason
+    local -a includes=()
+    fs_path=$path
+    if [[ -n $config_root ]] && ! fs_path=$(nginx_config_root_path "$config_root" "$path"); then
+        nginx_config_skip path_unresolved "$path"
         return
     fi
-    id=$(file_id "$path") || { printf '@skipped\n'; return; }
+    if [ ! -f "$fs_path" ]; then
+        if [[ $depth -gt 0 || $explicit_roots -eq 1 ]]; then nginx_config_skip missing_or_not_regular "$path"; fi
+        return
+    fi
+    id=$(file_id "$fs_path") || { nginx_config_skip stat_failed "$path"; return; }
     [[ $seen_files != *" $id "* ]] || return 0
+    if [[ $count -ge 64 ]]; then nginx_config_skip file_limit "$path"; return 1; fi
     seen_files+="$id "
     count=$((count + 1))
-    size=$(stat -Lc '%s' -- "$path" 2>/dev/null) || size=
-    if [[ ! $size =~ ^[0-9]+$ ]] || [ "$size" -gt 65536 ] ||
-       ! content=$(head -c 65536 -- "$path" 2>/dev/null); then
-        printf '@skipped\n'
+    size=$(stat -Lc '%s' -- "$fs_path" 2>/dev/null) || { nginx_config_skip stat_failed "$path"; return; }
+    if [[ $size -gt 65536 ]]; then nginx_config_skip file_too_large "$path"; return; fi
+    if ! content=$(head -c 65536 -- "$fs_path" 2>/dev/null); then
+        nginx_config_skip read_failed "$path"
         return
     fi
     printf '@file %s\n' "$(jstr "$(san_field "$path")")"
-    printf '%s\n' "$content" | sed 's/^/@line /'
-    while IFS= read -r target; do
-        target=${target#\"}; target=${target%\"}
-        target=${target#\'}; target=${target%\'}
-        if (( depth >= 8 )) || [[ ! $target =~ ^[a-zA-Z0-9/._*-]+$ ]]; then
-            printf '@skipped\n'
+    while IFS= read -r entry; do
+        case $entry in
+            '@include '*) includes+=("${entry#@include }") ;;
+            '@problem '*)
+                read -r _ problem_line reason <<< "$entry"
+                nginx_config_skip "$reason" "$path" "$problem_line" ;;
+            *) printf '%s\n' "$entry" ;;
+        esac
+    done < <(nginx_config_directives <<< "$content")
+    for target in ${includes[@]+"${includes[@]}"}; do
+        if [[ $target != /* ]]; then target=$base/$target; fi
+        if (( depth >= 8 )); then
+            nginx_config_skip include_depth_limit "$target"
             continue
         fi
-        if [[ $target != /* ]]; then target=$base/$target; fi
-        if [[ $target == *'*'* ]]; then
-            dir=${target%/*}
-            suffix=${target##*/}
-            if [[ $dir == *'*'* || $suffix != '*'* || ${suffix:1} == *'*'* ]]; then
-                printf '@skipped\n'; continue
-            fi
-            suffix=${suffix:1}
-            has_match=0
-            for match in "$dir"/*"$suffix"; do
-                [ -f "$match" ] || continue
-                has_match=1
-                nginx_config_stream "$match" "$base" "$((depth + 1))"
-                (( count < 64 )) || { printf '@skipped\n'; break; }
-            done
-            if [ "$has_match" -eq 0 ] && [ ! -r "$dir" ]; then printf '@skipped\n'; fi
+        if [[ $target == *[\*\?\[]* ]]; then
+            nginx_config_glob "$target" "$base" "$((depth + 1))"
         else
-            nginx_config_stream "$target" "$base" "$((depth + 1))"
+            nginx_config_stream "$target" "$base" "$((depth + 1))" || break
         fi
-        (( count < 64 )) || break
-    done < <(awk '{
-        sub(/#.*/, "")
-        n=split($0,parts,/[{};]/)
-        for(i=1;i<n;i++) if(parts[i]~/^[[:space:]]*include[[:space:]]+/) {
-            sub(/^[[:space:]]*include[[:space:]]+/,"",parts[i])
-            sub(/[[:space:]]+$/,"",parts[i])
-            print parts[i]
-        }
-    }' <<< "$content")
+    done
 }
 
 nginx2root_config() {
-    local config count=0 explicit_roots=0
+    local config config_root= count=0 explicit_roots=0 directory_reader=
+    local directory_entries_examined=0 glob_expansions=0 glob_budget_reached=false
+    local directory_limit=${config_directory_remaining:-$NGINX_CONFIG_DIRECTORY_LIMIT}
+    local glob_limit=${config_glob_remaining:-$NGINX_CONFIG_GLOB_LIMIT}
     local -a configs=()
+    if [[ ${1:-} == --root ]]; then
+        config_root=$2
+        shift 2
+    fi
     if [ "$#" -gt 0 ]; then
         configs=("$@")
         explicit_roots=1
     else
-        configs=(/etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* /usr/local/nginx/conf/nginx.conf)
+        configs=("$NGINX_SITE_CONFIG" /etc/nginx/nginx.conf '/etc/nginx/conf.d/*.conf'
+                 '/etc/nginx/sites-enabled/*' /usr/local/nginx/conf/nginx.conf)
+    fi
+    if have perl; then directory_reader=perl
+    elif have python3; then directory_reader=python3
     fi
     (
         local seen_files=' '
         for config in "${configs[@]}"; do
-            nginx_config_stream "$config" "$(dirname -- "$config")" 0
-            (( count < 64 )) || break
+            if [[ $explicit_roots -eq 0 && $config == *\** ]]; then
+                nginx_config_glob "$config" "${config%/*}" 0
+            else
+                nginx_config_stream "$config" "$(dirname -- "$config")" 0 || break
+            fi
         done
+        printf '@glob_budget %d %d %s\n' "$directory_entries_examined" "$glob_expansions" "$glob_budget_reached"
     ) | awk '
-        /^@file / { files++; file=substr($0,7); line=0; next }
-        /^@skipped$/ { skipped++; next }
-        /^@line / {
-            $0=substr($0,7)
-            line++
-            gsub(/"[^"]*"|\047[^\047]*\047/, "", $0)
-            sub(/#.*/, "", $0)
-            if ($0 ~ /(^|[;{}[:space:]])http2[[:space:]]+on([[:space:]]|;)/ ||
-                $0 ~ /(^|[;{}[:space:]])listen[[:space:]]+[^;]*[[:space:]]http2([[:space:]]|;)/) {h2=1; record("http2_on")}
-            if ($0 ~ /(^|[;{}[:space:]])http2[[:space:]]+off([[:space:]]|;)/) {h2off=1; record("http2_off")}
-            if ($0 ~ /(^|[;{}[:space:]])http3[[:space:]]+on([[:space:]]|;)/ ||
-                $0 ~ /(^|[;{}[:space:]])listen[[:space:]]+[^;]*[[:space:]]quic([[:space:]]|;)/) {h3=1; record("http3_or_quic")}
-            if ($0 ~ /(^|[;{}[:space:]])include[[:space:]]+/) includes=1
-            if ($0 ~ /(^|[;{}[:space:]])proxy_http_version[[:space:]]+2([[:space:]]|;)/) {upstream_h2=1; record("proxy_http_version_2")}
-            if ($0 ~ /(^|[;{}[:space:]])grpc_pass[[:space:]]+/) {grpc=1; record("grpc_upstream")}
-            if ($0 ~ /(^|[;{}[:space:]])resolver[[:space:]]+/) {resolver=1; record("resolver")}
-            if ($0 ~ /(^|[;{}[:space:]])(proxy_pass|grpc_pass|fastcgi_pass|uwsgi_pass|scgi_pass)[[:space:]]+/) {upstream=1; record("upstream")}
-            if ($0 ~ /(^|[;{}[:space:]])proxy_pass[[:space:]]+[^;]*\$/) {dynamic=1; record("dynamic_proxy_pass")}
-            if ($0 ~ /(^|[;{}[:space:]])mirror[[:space:]]+/) {mirror=1; record("mirror")}
-            if ($0 ~ /(^|[;{}[:space:]])mirror_request_body[[:space:]]+off([[:space:]]|;)/) {mirror_off=1; record("mirror_request_body_off")}
-            if ($0 ~ /(^|[;{}[:space:]])ssi[[:space:]]+on([[:space:]]|;)/) {ssi=1; record("ssi")}
-            if ($0 ~ /(^|[;{}[:space:]])mail[[:space:]]*\{/) {mail=1; record("mail")}
-            if ($0 ~ /(^|[;{}[:space:]])proxy[[:space:]]+on([[:space:]]|;)/) {mail_proxy=1; record("mail_proxy")}
-            if ($0 ~ /(^|[;{}[:space:]])auth_http[[:space:]]+/) {auth=1; record("auth_http")}
+        /^@file / { files++; file=substr($0,7); next }
+        /^@glob_budget / { directory_entries=$2; glob_expansions=$3; glob_budget_reached=$4; next }
+        /^@skipped / {
+            if (++skipped <= 16) details=details (details=="" ? "" : ",") substr($0,10)
+            next
         }
-        function record(hint) {
-            if (hint in seen || file=="") return
-            seen[hint]=1
-            entries=entries (entries=="" ? "" : ",") sprintf("{\"hint\":\"%s\",\"file\":%s,\"line\":%d}", hint,file,line)
+        /^@hint / {
+            key=$3
+            if (key in seen) next
+            seen[key]=1
+            if (key=="include_observed") next
+            entries=entries (entries=="" ? "" : ",") sprintf("{\"hint\":\"%s\",\"file\":%s,\"line\":%d}", key,file,$2)
         }
-        function b(value) { return value ? "true" : "false" }
         END {
+            keys="http2_on http2_off http3_or_quic upstream resolver dynamic_proxy_pass mirror mirror_request_body_off ssi mail mail_proxy auth_http include_observed proxy_http_version_2 grpc_upstream quic_listener dynamic_proxy_host"
             printf "{\"scope\":\"disk_directive_hints\",\"files_examined\":%d,\"skipped\":%d,", files, skipped
-            printf "\"http2_on\":%s,\"http2_off\":%s,\"http3_or_quic\":%s,", b(h2), b(h2off), b(h3)
-            printf "\"upstream\":%s,\"resolver\":%s,\"dynamic_proxy_pass\":%s,", b(upstream), b(resolver), b(dynamic)
-            printf "\"mirror\":%s,\"mirror_request_body_off\":%s,\"ssi\":%s,", b(mirror), b(mirror_off), b(ssi)
-            printf "\"mail\":%s,\"mail_proxy\":%s,\"auth_http\":%s,", b(mail), b(mail_proxy), b(auth)
-            printf "\"include_observed\":%s,\"proxy_http_version_2\":%s,\"grpc_upstream\":%s,\"scope_resolution\":\"file_directive_only\",\"evidence\":[%s]}", b(includes), b(upstream_h2), b(grpc), entries
+            printf "\"directory_entries_examined\":%d,\"glob_expansions\":%d,\"glob_budget_reached\":%s,", directory_entries, glob_expansions, (glob_budget_reached=="true" ? "true" : "false")
+            n=split(keys, flags, " ")
+            for (i=1; i<=n; i++) printf "\"%s\":%s,", flags[i], (flags[i] in seen ? "true" : "false")
+            printf "\"scope_resolution\":\"file_directive_only\",\"evidence\":[%s]", entries
+            if (skipped) printf ",\"skipped_details\":[%s]", details
+            printf "}"
         }'
 }
 
@@ -2279,7 +2306,7 @@ nginx2root_sctp() {
 apache_reference() {
     local raw=$1 scope=${2:-httpd}
     if [ "$scope" = module ]; then
-        [[ $raw =~ ^2\.0\.[0-9]+$ ]] || { printf unknown; return; }
+        [[ $raw =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf unknown; return; }
         if vlt "$raw" 2.0.8; then printf outside_upstream_range
         elif vle "$raw" 2.0.42; then printf potential
         else printf outside_upstream_range
@@ -2340,92 +2367,247 @@ apache_config_hints() {
         }'
 }
 
-apache_mapped_http2() {
-    local file=$1 data limit=1048576
-    [ -r "$file" ] || { printf null; return; }
-    if ! data=$(head -c "$((limit + 1))" -- "$file" 2>/dev/null); then printf null; return; fi
-    if grep -Eq '/mod_http2\.so( \(deleted\))?$' <<< "$data"; then printf true
-    elif [ "${#data}" -ge "$((limit - 1))" ]; then printf null
-    else printf false
+apache_http2_mappings() {
+    local LC_ALL=C file=$1 limit=$2 data bytes complete=true read_rc=0 records
+    # Keep the trailing newline and account for partial reads even when head fails.
+    data=$(head -c "$limit" -- "$file" 2>/dev/null; read_rc=$?; printf '.'; exit "$read_rc") || read_rc=$?
+    data=${data%.}
+    bytes=${#data}
+    if ((read_rc != 0)); then
+        printf 'false %d\n' "$bytes"
+        return
     fi
+    if ((bytes >= limit)); then
+        complete=false
+        # Only complete records can identify a mapped file.
+        case $data in
+            *$'\n') ;;
+            *$'\n'*) data=${data%$'\n'*} ;;
+            *) data= ;;
+        esac
+    fi
+    records=$(LC_ALL=C awk '
+        /\/mod_http2\.so( \(deleted\))?$/ && NF >= 6 {
+            range=$1; dev=$4; inode=$5; path=$0
+            for (i=0; i<5; i++) sub(/^[[:space:]]*[^[:space:]]+/, "", path)
+            sub(/^[[:space:]]+/, "", path)
+            if (path !~ /^\//) next
+            key=dev "\037" inode "\037" path
+            if (!seen[key]++) print range "\037" key
+        }
+    ' <<< "$data") || { records=; complete=false; }
+    printf '%s %d\n' "$complete" "$bytes"
+    if [[ -n $records ]]; then printf '%s\n' "$records"; fi
 }
 
 linux_inventory_unavailable() {
-    local format=$1 name=$2 cve=${3:-}
-    if [ "$format" = json ]; then
-        printf '{"status":"unavailable","reason":"linux_proc_required","platform":%s' "$(jstr "$OS")"
-        if [ -n "$cve" ]; then printf ',"cve":%s' "$(jstr "$cve")"; fi
-        printf ',"findings":[]}\n'
-    else
-        printf '%s · %s 上跳过主机核验（需要 Linux /proc）\n' "$name" "$OS"
-    fi
+    local name=$1 cve=${2:-}
+    printf '{"result":"pending","result_reason":"process_scan_unavailable","exit_code":3,"category":%s,"inventory_status":"unavailable","reason":"linux_proc_required","platform":%s' "$(jstr "$name")" "$(jstr "$OS")"
+    if [ -n "$cve" ]; then printf ',"cve":%s' "$(jstr "$cve")"; fi
+    printf ',"coverage":{"evidence_incomplete":true,"process_scan_unavailable":true}}\n' || return 2
     return 3
 }
 
 apache_inventory() {
-    local format=txt proc name pid path id start row= seen=' ' rows=0 disk=0 comma= version reference mapped config
-    local gate=0 modules=0 unknown=0 explicit= proc_limit=false unresolved=0 image_state match package_hint http2_evidence disk_http2=condition_not_observed
-    local -a configs=()
+    local proc name pid path id start row= seen=' ' rows=0 disk=0 comma= version reference mapped config
+    local gate=0 modules=0 unknown=0 proc_limit=false unresolved=0 image_state match package_hint http2_evidence disk_http2=condition_not_observed module_version_source
+    local maps_report maps_complete module_mappings runtime_modules module_pending incomplete_module_processes=0 process_result httpd_result
+    local map_bytes_read=0 map_budget_reached=false map_remaining map_limit map_read_bytes
+    local process_paths= process_entries=0 process_budget_reached=false process_scan_unavailable=false visibility_limited=false
+    local image_key image_index image_count=0
+    local -a image_keys=() image_versions=() image_packages=()
+    local runtime_module_count=0 module_index
+    local -a runtime_module_ids=() runtime_module_versions=() runtime_module_mapped=() module_mapping_indexes=()
+    local -a configs=() explicit_paths=()
     while (($#)); do
         case $1 in
-            --json) format=json ;;
+            --json) ;;
             --apache-path)
-                (($# > 1)) && [ -f "$2" ] || die "--apache-path 需要存在的文件"
-                explicit=$2; shift ;;
+                (($# > 1)) && [ -n "$2" ] && [[ $2 != --* ]] || die "--apache-path requires a file path."
+                explicit_paths+=("$2"); shift ;;
             --apache-config)
-                (($# > 1)) && [ -f "$2" ] || die "--apache-config 需要存在的文件"
+                (($# > 1)) && [ -n "$2" ] && [[ $2 != --* ]] || die "--apache-config requires a file path."
                 configs+=("$2"); shift ;;
             --help|-h)
-                printf '用法: %s --apache2root [--json] [--apache-path PATH] [--apache-config FILE]\n' "$PROG"
+                usage
                 return ;;
-            *) die "未知 Apache2Root 选项: $1" ;;
+            *) die "Unknown Apache option. See --help." ;;
         esac
         shift
     done
-    if [ "$OS" != Linux ]; then
-        linux_inventory_unavailable "$format" Apache CVE-2026-119618
+    for path in ${explicit_paths[@]+"${explicit_paths[@]}"}; do
+        [ -f "$path" ] || die "--apache-path requires an existing file."
+    done
+    for path in ${configs[@]+"${configs[@]}"}; do
+        [ -f "$path" ] || die "--apache-config requires an existing file."
+    done
+    if [[ $OS != Linux ]]; then
+        linux_inventory_unavailable Apache CVE-2026-119618
         return $?
     fi
     config=$(apache_config_hints ${configs[@]+"${configs[@]}"})
     if [[ $config == *'"load_module":true'* || $config == *'"h2":true'* || $config == *'"h2c":true'* ]]; then
         disk_http2=disk_hints_present
     fi
-    for proc in /proc/[0-9]*; do
-        [ -r "$proc/comm" ] || continue
-        IFS= read -r name < "$proc/comm" 2>/dev/null || continue
+    if [[ -r /proc/self/stat ]]; then
+        process_paths=$(linux_process_paths) || process_scan_unavailable=true
+    else
+        process_scan_unavailable=true
+    fi
+
+    apache_assess_loaded_modules() {
+        local proc_dir=$1 mappings=$2 range dev inode module_path major minor expected probe
+        local module_version version_source module_reference module_result reason sep=
+        while LC_ALL=C IFS=$'\037' read -r range dev inode module_path; do
+            [[ -n $module_path ]] || continue
+            probe= module_version= version_source=unknown
+            module_result=pending reason=module_identity_unverified module_reference=unknown
+            major=${dev%%:*}
+            minor=${dev##*:}
+            if [[ $dev == *:* && $major =~ ^[[:xdigit:]]+$ && $minor =~ ^[[:xdigit:]]+$ &&
+                  $inode =~ ^[1-9][0-9]*$ && $range =~ ^[[:xdigit:]]+-[[:xdigit:]]+$ ]]; then
+                expected="$((16#$major)) $((16#$minor)) $inode"
+                if [[ $(file_id "$proc_dir/map_files/$range") == "$expected" &&
+                      -r $proc_dir/map_files/$range ]]; then
+                    probe="$proc_dir/map_files/$range"
+                    version_source=map_files
+                elif [[ $module_path != *" (deleted)" &&
+                        $(file_id "$proc_dir/root$module_path") == "$expected" ]]; then
+                    probe="$proc_dir/root$module_path"
+                    version_source=process_root
+                fi
+            fi
+            if [[ -n $probe ]]; then
+                for ((module_index=0; module_index<runtime_module_count; module_index++)); do
+                    [[ ${runtime_module_ids[module_index]} != "$expected" ]] || break
+                done
+                if ((module_index < runtime_module_count)); then
+                    module_version=${runtime_module_versions[module_index]}
+                else
+                    module_version=$(apache_version "$probe" module)
+                fi
+                if [[ $(file_id "$probe") == "$expected" ]]; then
+                    if ((module_index == runtime_module_count)); then
+                        runtime_module_ids[module_index]=$expected
+                        runtime_module_versions[module_index]=$module_version
+                        runtime_module_count=$((runtime_module_count + 1))
+                    fi
+                    module_mapping_indexes+=("$module_index")
+                    module_reference=$(apache_reference "$module_version" module)
+                    case $module_reference in
+                        unknown) reason=module_version_unknown ;;
+                        potential) reason=module_patch_unverified ;;
+                        *) module_result=no_risk; reason=module_version_outside_range ;;
+                    esac
+                else
+                    module_version= version_source=unknown
+                fi
+            fi
+            if [[ $module_result == pending ]]; then module_pending=true; fi
+            runtime_modules+="$sep{\"path\":$(jstr "$module_path"),\"version\":$(jstr "$module_version"),\"version_source\":\"$version_source\",\"version_reference\":\"$module_reference\",\"patch_verified\":false,\"result\":\"$module_result\",\"result_reason\":\"$reason\"}"
+            sep=,
+        done <<< "$mappings"
+    }
+
+    while IFS= read -r proc; do
+        [ -n "$proc" ] || continue
+        if ((process_entries >= PROCESS_SCAN_LIMIT)); then
+            process_budget_reached=true
+            proc_limit=true
+            break
+        fi
+        process_entries=$((process_entries + 1))
+        if ! IFS= read -r name 2>/dev/null < "$proc/comm"; then
+            if [[ -d $proc ]]; then visibility_limited=true; fi
+            continue
+        fi
         case $name in apache2|httpd) ;; *) continue ;; esac
-        ((rows < 24)) || { proc_limit=true; break; }
         pid=${proc##*/}
         start=$(java_process_start "$pid")
         path=$(readlink "$proc/exe" 2>/dev/null || :)
         id=$(file_id "$proc/exe" || :)
-        version=$(apache_version "$proc/exe" httpd)
-        mapped=$(apache_mapped_http2 "$proc/maps")
+        image_key="$id:$path"
+        for ((image_index=0; image_index<image_count; image_index++)); do
+            [[ ${image_keys[image_index]} != "$image_key" ]] || break
+        done
+        version=
+        if ((image_index < image_count)); then
+            version=${image_versions[image_index]}
+        elif [[ -n $id && -n $start ]]; then
+            version=$(apache_version "$proc/exe" httpd)
+        fi
+        # Module mappings can differ between workers using the same binary.
+        maps_report= maps_complete=false
+        map_remaining=$((APACHE_MAP_SCAN_TOTAL_BYTES - map_bytes_read))
+        if ((map_remaining > 0)); then
+            map_limit=$APACHE_MAP_SCAN_MAX_BYTES
+            if ((map_remaining < map_limit)); then map_limit=$map_remaining; fi
+            maps_report=$(apache_http2_mappings "$proc/maps" "$map_limit") ||
+                die "Cannot record the Apache process map byte count."
+            read -r maps_complete map_read_bytes <<< "${maps_report%%$'\n'*}" ||
+                die "Cannot parse the Apache process map byte count."
+            map_bytes_read=$((map_bytes_read + map_read_bytes))
+        fi
+        if ((map_bytes_read >= APACHE_MAP_SCAN_TOTAL_BYTES)); then map_budget_reached=true; fi
+        module_mappings= runtime_modules= module_pending=false
+        module_mapping_indexes=()
+        if [[ $maps_report == *$'\n'* ]]; then
+            module_mappings=${maps_report#*$'\n'}
+            mapped=true
+            if [[ -n $id && -n $start ]]; then apache_assess_loaded_modules "$proc" "$module_mappings"; fi
+        elif [[ $maps_complete == true ]]; then
+            mapped=false
+        else
+            mapped=null
+        fi
         image_state=$(web_disk_identity "$proc" "$path" "$id")
         if [[ -z $id || -z $start || $(file_id "$proc/exe") != "$id" ||
               $(java_process_start "$pid") != "$start" ]]; then
             version=
             mapped=null
-            image_state=unverified
+            maps_complete=false
+            runtime_modules= module_pending=false
+            module_mapping_indexes=()
+            # Keep a reported identity conflict visible instead of converting it to a read failure.
+            case $image_state in mismatch|deleted) ;; *) image_state=unverified ;; esac
+        elif ((image_index == image_count)); then
+            image_keys[image_index]=$image_key
+            image_versions[image_index]=$version
+            image_packages[image_index]=
+            image_count=$((image_count + 1))
+        fi
+        for module_index in ${module_mapping_indexes[@]+"${module_mapping_indexes[@]}"}; do
+            runtime_module_mapped[module_index]=true
+        done
+        package_hint=null
+        if [[ $image_state == matched && -n $id && $(file_id "$path") == "$id" ]]; then
+            seen+="$id "
+            if [[ -z ${image_packages[image_index]} ]]; then
+                package_hint=$(web_package_hint "$path")
+                image_packages[image_index]=${package_hint:-null}
+            fi
+            package_hint=${image_packages[image_index]}
         fi
         match=$(web_identity_boolean "$image_state")
-        if [[ $image_state != matched || $mapped == null ]]; then
+        if [[ $image_state != matched || $maps_complete != true ]]; then
             unresolved=$((unresolved + 1))
         fi
+        if [[ $module_pending == true ]]; then incomplete_module_processes=$((incomplete_module_processes + 1)); fi
         http2_evidence=$disk_http2
         [[ $mapped != true ]] || http2_evidence=module_mapped
         reference=$(apache_reference "$version")
         [[ $reference != potential ]] || gate=1
         [[ $reference != unknown ]] || unknown=1
-        if [ "$format" = json ]; then
-            row+="$comma{\"kind\":\"process\",\"pid\":$pid,\"path\":$(jstr "$(san_field "$path")"),\"version\":$(jstr "$version"),\"version_status\":$(jstr "$reference"),\"mod_http2_mapped\":$mapped,\"http2_evidence\":\"$http2_evidence\",\"disk_identity_matched\":$match,\"disk_identity_status\":\"$image_state\"}"
-            comma=,
-        else
-            printf 'Apache PID %s · %q · %s · %s · mod_http2 映射 %s · 磁盘身份 %s · HTTP/2 证据 %s\n' "$pid" "$path" "${version:-版本未知}" "$reference" "$mapped" "$image_state" "$http2_evidence"
+        httpd_result=$(output_result "$reference")
+        process_result=$httpd_result
+        if [[ $process_result != risk && ( $module_pending == true || $maps_complete != true ) ]]; then
+            process_result=pending
         fi
+        row+="$comma{\"kind\":\"process\",\"pid\":$pid,\"path\":$(jstr "$(san_field "$path")"),\"version\":$(jstr "$version"),\"result\":\"$process_result\",\"httpd_result\":\"$httpd_result\",\"mod_http2_mapped\":$mapped,\"mod_http2_mappings_complete\":$maps_complete,\"mod_http2_modules\":[$runtime_modules],\"http2_evidence\":\"$http2_evidence\",\"disk_identity_matched\":$match,\"disk_identity_status\":\"$image_state\",\"package_evidence\":${package_hint:-null}}"
+        comma=,
         rows=$((rows + 1))
-    done
-    for path in "$explicit" "$(type -P apache2 || :)" "$(type -P httpd || :)" /usr/sbin/apache2 /usr/sbin/httpd /usr/local/apache2/bin/httpd; do
+    done <<< "$process_paths"
+    for path in ${explicit_paths[@]+"${explicit_paths[@]}"} "$(type -P apache2 || :)" "$(type -P httpd || :)" /usr/sbin/apache2 /usr/sbin/httpd /usr/local/apache2/bin/httpd; do
         [ -n "$path" ] && [ -f "$path" ] || continue
         id=$(file_id "$path") || continue
         [[ $seen != *" $id "* ]] || continue
@@ -2435,47 +2617,78 @@ apache_inventory() {
         [[ $reference != potential ]] || gate=1
         [[ $reference != unknown ]] || unknown=1
         package_hint=$(web_package_hint "$path")
-        if [ "$format" = json ]; then
-            row+="$comma{\"kind\":\"installation\",\"path\":$(jstr "$(san_field "$path")"),\"version\":$(jstr "$version"),\"version_status\":$(jstr "$reference"),\"package_evidence\":${package_hint:-null},\"http2_evidence\":\"$disk_http2\"}"
-            comma=,
-        else
-            printf 'Apache 磁盘安装 · %q · %s · %s\n' "$path" "${version:-版本未知}" "$reference"
-        fi
-        if [[ $format != json && -n $package_hint ]]; then printf '软件包线索: %s\n' "$package_hint"; fi
+        row+="$comma{\"kind\":\"installation\",\"path\":$(jstr "$(san_field "$path")"),\"version\":$(jstr "$version"),\"result\":$(jstr "$(output_result "$reference")"),\"package_evidence\":${package_hint:-null},\"http2_evidence\":\"$disk_http2\"}"
+        comma=,
         disk=$((disk + 1))
     done
     for path in /usr/lib/apache2/modules/mod_http2.so /usr/lib64/httpd/modules/mod_http2.so /usr/lib/httpd/modules/mod_http2.so /usr/local/apache2/modules/mod_http2.so; do
         [ -f "$path" ] || continue
         id=$(file_id "$path") || continue
         [[ $seen != *" $id "* ]] || continue
+        for ((module_index=0; module_index<runtime_module_count; module_index++)); do
+            [[ ${runtime_module_ids[module_index]} != "$id" ]] || break
+        done
+        # A verified live mapping already carries the assessment for this file.
+        if ((module_index < runtime_module_count)) && [[ ${runtime_module_mapped[module_index]:-false} == true ]]; then
+            continue
+        fi
         seen+="$id "
         version=$(apache_version "$path" module)
+        module_version_source=binary
+        if [[ -z $version ]]; then
+            version=$(apache_module_rpm_version "$path")
+            module_version_source=rpm_package
+        fi
+        [[ -n $version ]] || module_version_source=unknown
         reference=$(apache_reference "$version" module)
         [[ $reference != potential ]] || gate=1
         [[ $reference != unknown ]] || unknown=1
         package_hint=$(web_package_hint "$path")
-        if [ "$format" = json ]; then
-            row+="$comma{\"kind\":\"module_installation\",\"httpd_association\":\"unverified\",\"path\":$(jstr "$(san_field "$path")"),\"version\":$(jstr "$version"),\"version_status\":$(jstr "$reference"),\"package_evidence\":${package_hint:-null},\"http2_evidence\":\"$disk_http2\"}"
-            comma=,
-        else
-            printf 'Apache 磁盘模块 · %q · %s · %s · 所属 httpd 待核验\n' "$path" "${version:-版本未知}" "$reference"
-        fi
-        if [[ $format != json && -n $package_hint ]]; then printf '软件包线索: %s\n' "$package_hint"; fi
+        row+="$comma{\"kind\":\"module_installation\",\"httpd_association\":\"unverified\",\"path\":$(jstr "$(san_field "$path")"),\"version\":$(jstr "$version"),\"version_source\":\"$module_version_source\",\"result\":$(jstr "$(output_result "$reference")"),\"package_evidence\":${package_hint:-null},\"http2_evidence\":\"$disk_http2\"}"
+        comma=,
         modules=$((modules + 1))
     done
-    local status=observed
-    ((rows + disk + modules > 0)) || status=not_observed
-    if [ "$format" = json ]; then
-        printf '{"status":"%s","cve":"CVE-2026-119618","patch_verified":false,"configuration":%s,"proc_limit_reached":%s,"coverage":{"proc_limit_reached":%s,"incomplete_process_evidence":%d},"findings":[%s]}' \
-            "$status" "$config" "$proc_limit" "$proc_limit" "$unresolved" "$row"
+    local status=observed result=no_risk result_reason=risk_gate_not_hit exit_code
+    local coverage_reason incomplete=false config_incomplete=false
+    if process_visibility_limited; then visibility_limited=true; fi
+    if [[ $config =~ \"skipped\":[1-9] ]]; then config_incomplete=true; fi
+    if [[ $map_budget_reached == true ]]; then
+        coverage_reason=scan_budget_exhausted
     else
-        if [ "$status" = not_observed ]; then printf 'Apache · 当前范围未观察到安装或进程\n'; fi
-        printf 'Apache CVE-2026-119618 · 磁盘配置线索: %s\n' "$config"
-        printf '进程覆盖 · 达到上限 %s · 证据不完整 %s\n' "$proc_limit" "$unresolved"
+        coverage_reason=$(web_coverage_reason "$proc_limit" "$process_budget_reached" "$process_scan_unavailable" "$visibility_limited" "$unresolved" "$config_incomplete")
     fi
-    if [ "$gate" -eq 1 ]; then return 1; fi
-    if web_coverage_incomplete "$proc_limit" "$unresolved" "$config" || [ "$unknown" -eq 1 ]; then return 3; fi
-    return 0
+    if [[ -z $coverage_reason ]] && ((incomplete_module_processes > 0)); then coverage_reason=module_evidence_incomplete; fi
+    if [[ -z $coverage_reason && $unknown -eq 1 ]]; then coverage_reason=version_match_unknown; fi
+    if [[ -n $coverage_reason ]]; then incomplete=true; fi
+    if ((rows + disk + modules == 0)); then status=not_observed; fi
+    if ((gate == 1)); then
+        result=risk
+        result_reason=risk_gate_hit
+    elif [[ -n $coverage_reason ]]; then
+        result=pending
+        result_reason=$coverage_reason
+    elif [[ $status == not_observed ]]; then
+        result_reason=no_apache_findings
+    fi
+    exit_code=$(scan_exit_code "$result")
+    printf '{"result":"%s","result_reason":"%s","exit_code":%s,"category":"Apache2Root"' "$result" "$result_reason" "$exit_code"
+    printf ',"inventory_status":"%s","cve":"CVE-2026-119618","patch_verified":false,"configuration":%s,"proc_limit_reached":%s,' \
+        "$status" "$config" "$proc_limit"
+    printf '"coverage":{"evidence_incomplete":%s,"configuration_incomplete":%s,"proc_limit_reached":%s,"incomplete_process_evidence":%d,"incomplete_module_processes":%d,"process_visibility_limited":%s,"process_scan_limit":%s,"process_entries_examined":%s,"process_budget_reached":%s,"process_scan_unavailable":%s,' \
+        "$incomplete" "$config_incomplete" "$proc_limit" "$unresolved" "$incomplete_module_processes" "$visibility_limited" "$PROCESS_SCAN_LIMIT" "$process_entries" "$process_budget_reached" "$process_scan_unavailable"
+    printf '"map_read_limit_bytes":%s,"map_total_limit_bytes":%s,"map_bytes_read":%s,"map_budget_reached":%s},"findings":[%s]}\n' \
+        "$APACHE_MAP_SCAN_MAX_BYTES" "$APACHE_MAP_SCAN_TOTAL_BYTES" "$map_bytes_read" "$map_budget_reached" "$row" || return 2
+    return "$exit_code"
+}
+
+apache_module_rpm_version() {
+    local path=$1 info name version
+    have rpm && have timeout || return 0
+    info=$(run_timed_command timeout -k 1s 2s rpm -qf --qf '%{NAME}\t%{VERSION}\n' -- "$path" 2>/dev/null) || return 0
+    [[ $info != *$'\n'* ]] || return 0
+    IFS=$'\t' read -r name version <<< "$info"
+    [[ $name == mod_http2 && $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
+    printf '%s' "$version"
 }
 
 apache_version() {
@@ -2492,40 +2705,58 @@ apache_version() {
 }
 
 audit_all() {
-    local format=txt rc_java=0 rc_nginx=0 rc_apache=0 java_report nginx_report apache_report
-    local -a java_args=(--quiet) nginx_args=() apache_args=()
+    local java_report nginx_report apache_report report name status result=no_risk result_reason exit_code
+    local java_rc=0 nginx_rc=0 apache_rc=0 execution_failed=0
+    local fallback='{"result":"pending","result_reason":"report_unavailable","exit_code":2,"error":"report_unavailable"}'
+    local result_pattern='^\{"result":"(risk|pending|no_risk)"[,}]'
+    local -a java_args=() nginx_args=() apache_args=()
     while (($#)); do
         case $1 in
-            --json) format=json ;;
+            --json) ;;
             --jcmd) java_args+=("$1") ;;
             --nginx-path|--nginx-config)
-                (($# >= 2)) || die "$1 需要一个路径"
+                (($# >= 2)) || die "$1 requires a file path."
                 nginx_args+=("$1" "$2"); shift ;;
             --apache-path|--apache-config)
-                (($# >= 2)) || die "$1 需要一个路径"
+                (($# >= 2)) || die "$1 requires a file path."
                 apache_args+=("$1" "$2"); shift ;;
-            *) die "未知批量检查选项: $1" ;;
+            *) die "Unknown full scan option. See --help." ;;
         esac
         shift
     done
-    if [ "$format" = json ]; then
-        java_report=$(java4shell_main "${java_args[@]}" --json) || rc_java=$?
-        nginx_report=$(nginx2root_scan ${nginx_args[@]+"${nginx_args[@]}"} --json) || rc_nginx=$?
-        apache_report=$(apache_inventory --json ${apache_args[@]+"${apache_args[@]}"}) || rc_apache=$?
-        printf '{"scope":"local_read_only_inventory","java4shell":%s,"nginx2root":%s,"apache":%s,"exit_codes":{"java4shell":%s,"nginx2root":%s,"apache2root":%s}}\n' \
-            "${java_report:-null}" "${nginx_report:-null}" "${apache_report:-null}" "$rc_java" "$rc_nginx" "$rc_apache"
-    else
-        printf '=== Java4Shell ===\n'
-        (java4shell_main "${java_args[@]}") || rc_java=$?
-        printf '\n=== Nginx2Root ===\n'
-        (nginx2root_scan ${nginx_args[@]+"${nginx_args[@]}"}) || rc_nginx=$?
-        printf '\n=== Apache HTTP Server ===\n'
-        apache_inventory ${apache_args[@]+"${apache_args[@]}"} || rc_apache=$?
+    java_report=$(java4shell_main ${java_args[@]+"${java_args[@]}"}) || java_rc=$?
+    nginx_report=$(nginx2root_scan ${nginx_args[@]+"${nginx_args[@]}"}) || nginx_rc=$?
+    apache_report=$(apache_inventory ${apache_args[@]+"${apache_args[@]}"}) || apache_rc=$?
+
+    # Each specialist emits result first, before any per-asset result fields.
+    for name in java_report nginx_report apache_report; do
+        report=${!name}
+        if [[ $report =~ $result_pattern && $report == *'}' ]]; then
+            status=${BASH_REMATCH[1]}
+        else
+            printf -v "$name" '%s' "$fallback"
+            status=pending
+            execution_failed=1
+        fi
+        case $status in
+            risk) result=risk ;;
+            pending) [[ $result == risk ]] || result=pending ;;
+        esac
+    done
+    exit_code=$(scan_exit_code "$result")
+    case $result in
+        risk) result_reason=risk_gate_hit ;;
+        pending) result_reason=specialist_evidence_incomplete ;;
+        no_risk) result_reason=risk_gate_not_hit ;;
+    esac
+    if ((execution_failed || java_rc == 2 || nginx_rc == 2 || apache_rc == 2 ||
+         java_rc > 3 || nginx_rc > 3 || apache_rc > 3)); then
+        exit_code=2
+        result_reason=execution_failed
     fi
-    if ((rc_java == 2 || rc_nginx == 2 || rc_apache == 2)); then return 2; fi
-    if ((rc_java == 1 || rc_nginx == 1 || rc_apache == 1)); then return 1; fi
-    if ((rc_java != 0 || rc_nginx != 0 || rc_apache != 0)); then return 3; fi
-    return 0
+    printf '{"result":"%s","result_reason":"%s","exit_code":%s,"scope":"local_read_only_inventory","java4shell":%s,"nginx2root":%s,"apache":%s}\n' \
+        "$result" "$result_reason" "$exit_code" "$java_report" "$nginx_report" "$apache_report" || return 2
+    return "$exit_code"
 }
 
 web_disk_identity() {
@@ -2542,77 +2773,172 @@ web_identity_boolean() {
     case $1 in matched) printf true ;; mismatch|deleted) printf false ;; *) printf null ;; esac
 }
 
-web_coverage_incomplete() {
-    local limit=$1 unresolved=$2 config=$3
-    [[ $limit == true || $unresolved -gt 0 || $config =~ \"skipped\":[1-9] ]]
+web_coverage_reason() {
+    local limit=$1 budget_reached=$2 scan_unavailable=$3 visibility_limited=$4 unresolved=$5 config_incomplete=$6
+    if [[ $limit == true || $budget_reached == true ]]; then
+        printf scan_budget_exhausted
+    elif [[ $scan_unavailable == true ]]; then
+        printf process_scan_unavailable
+    elif [[ $visibility_limited == true ]]; then
+        printf process_visibility_limited
+    elif ((unresolved > 0)); then
+        printf runtime_evidence_incomplete
+    elif [[ $config_incomplete == true ]]; then
+        printf configuration_incomplete
+    fi
 }
 
 web_package_hint() {
-    local path=$1 owner manager result
+    local path=$1 ownership owner manager result
     have timeout || return 0
     [[ $path == /* ]] || return 0
     if have dpkg-query; then
-        owner=$(timeout 2 dpkg-query -S -- "$path" 2>/dev/null | awk -F ': ' -v target="$path" '$2 == target { print $1 }')
+        ownership=$(run_timed_command timeout -k 1s 2s dpkg-query -S -- "$path" 2>/dev/null) || return 0
+        owner=$(PACKAGE_QUERY_PATH="$path" awk '
+            { separator=index($0,": ") }
+            separator && substr($0,separator+2) == ENVIRON["PACKAGE_QUERY_PATH"] {
+                print substr($0,1,separator-1)
+            }
+        ' <<< "$ownership") || return 0
         [[ $owner =~ ^[[:alnum:].+:-]+$ ]] || return 0
         manager=dpkg
-        result=$(timeout 2 dpkg-query -W -f='${binary:Package} ${Version} ${db:Status-Status}' -- "$owner" 2>/dev/null) || return 0
+        result=$(run_timed_command timeout -k 1s 2s dpkg-query -W -f='${binary:Package} ${Version} ${db:Status-Status}' -- "$owner" 2>/dev/null) || return 0
         [[ $result == *" installed" ]] || return 0
         result=${result% installed}
     elif have rpm; then
         manager=rpm
-        result=$(timeout 2 rpm -qf --qf '%{NAME} %{VERSION}-%{RELEASE}' -- "$path" 2>/dev/null) || return 0
+        result=$(run_timed_command timeout -k 1s 2s rpm -qf --qf '%{NAME} %{VERSION}-%{RELEASE}' -- "$path" 2>/dev/null) || return 0
     else
         return 0
     fi
-    [ -n "$result" ] || return 0
+    [[ -n $result && $result != *$'\n'* ]] || return 0
     printf '{"manager":%s,"installed_package":%s,"patch_status":"unverified"}' "$(jstr "$manager")" "$(jstr "$(san_field "$result")")"
 }
 
 nginx2root_scan() {
-    local format=txt explicit="" installed path proc pid id current raw matched
-    local seen=' ' rows=0 comma= gate=0 unknown=0 total=0 config_report sctp_report package_hint
-    local start image_state proc_limit=false unresolved=0 self_ns process_ns self_root metadata flavor plus module_hints product_version config_entry row_config config_source incomplete=false gate_hit=false
-    local index package_count=0 condition_not_observed=0 potential_missing=0 unknown_missing=0 unattributed=0 incomplete_config=0 config_incomplete=false unmapped= unmapped_seen=" "
+    local path proc pid id raw title_path hint_source path_source version_source same_host possible_host process_root disk_id package_id
+    local site_prefix=${NGINX_SITE_CONFIG%/conf/nginx.conf}
+    local seen=' ' master_count=0 comma= gate=0 unknown=0 version_unknown=false total=0 config_report sctp_report package_hint findings=
+    local start image_state proc_limit=false unresolved=0 self_ns process_ns self_root metadata flavor plus module_hints product_version compiled_config config_entry row_config config_source incomplete=false
+    local index package_count=0 condition_not_observed=0 potential_missing=0 unknown_missing=0 unattributed=0 incomplete_config=0 unmapped= unmapped_seen=" "
+    local config_blocking=false config_incomplete=false
+    local config_directory_remaining=$NGINX_CONFIG_DIRECTORY_LIMIT config_glob_remaining=$NGINX_CONFIG_GLOB_LIMIT
+    local config_glob_budget_reached=false
+    local process_paths= process_entries=0 process_budget_reached=false process_scan_unavailable=false visibility_limited=false
+    local process_role config_proc config_start config_parent_pid image_index image_count=0
+    local config_count=0
     local -a package_ids=() package_values=()
-    local -a config_paths=()
+    local -a config_paths=() explicit_paths=() processes=() installation_paths=() image_ids=() image_metadata=()
+    local -a config_scopes=() config_entries=() config_values=()
     while (($#)); do
         case $1 in
-            --json|--format=json) format=json ;;
+            --json) ;;
             --nginx-config)
-                (($# > 1)) && [ -n "$2" ] && [[ $2 != --* ]] || die "--nginx-config 需要文件路径"
+                (($# > 1)) && [ -n "$2" ] && [[ $2 != --* ]] || die "--nginx-config requires a file path."
                 config_paths+=("$2"); shift ;;
             --nginx-path)
-                (($# > 1)) && [ -f "$2" ] || die "--nginx-path 需要存在的文件"
-                explicit=$(readlink -f -- "$2") || die "--nginx-path 无法解析路径"
-                shift ;;
+                (($# > 1)) && [ -n "$2" ] && [[ $2 != --* ]] || die "--nginx-path requires a file path."
+                explicit_paths+=("$2"); shift ;;
             --help|-h)
-                printf '用法: %s --nginx2root [--json] [--nginx-path PATH] [--nginx-config FILE]\n' "$PROG"
+                usage
                 return ;;
-            *) die "未知 Nginx2Root 选项: $1" ;;
+            *) die "Unknown NGINX option. See --help." ;;
         esac
         shift
     done
-    if [ "$OS" != Linux ]; then
-        linux_inventory_unavailable "$format" Nginx2Root
+    for path in ${explicit_paths[@]+"${explicit_paths[@]}"}; do
+        [ -f "$path" ] || die "--nginx-path requires an existing file."
+        path=$(readlink -f -- "$path") || die "Cannot resolve the --nginx-path file path."
+        installation_paths+=("$path")
+    done
+    for path in ${config_paths[@]+"${config_paths[@]}"}; do
+        [ -f "$path" ] || die "--nginx-config requires an existing file."
+    done
+    if [[ $OS != Linux ]]; then
+        linux_inventory_unavailable Nginx2Root
         return $?
     fi
-    config_report=$(nginx2root_config ${config_paths[@]+"${config_paths[@]}"})
-    sctp_report=$(nginx2root_sctp)
-    if [ "$format" = json ]; then
-        printf '{"status":"collected","source":"local_binary_inventory","patch_verified":false,"exploitability_confirmed":false,"sctp":%s,"configuration":%s,"sources":["https://nginx.org/en/security_advisories.html","https://cert.europa.eu/publications/security-advisories/2026-022/","https://openresty.org/en/ann-1031008001.html","https://openresty.org/en/changelog-1025003.html","https://openresty.org/en/changelog-1027001.html","https://github.com/alibaba/tengine/blob/3.2.0-rc5/src/core/nginx.h","https://docs.nginx.com/nginx-ingress-controller/releases/","https://docs.nginx.com/nginx/releases/"],"findings":[' "$sctp_report" "$config_report"
+    if [[ -r /proc/self/stat ]]; then
+        process_paths=$(linux_process_paths) || process_scan_unavailable=true
     else
-        printf 'NGINX 上游版本参考 · 仅覆盖本专项五项 CVE\n磁盘配置线索: %s\n内核 SCTP 线索: %s\n' "$config_report" "$sctp_report"
+        process_scan_unavailable=true
     fi
+    while IFS= read -r proc; do
+        [ -n "$proc" ] || continue
+        if ((process_entries >= PROCESS_SCAN_LIMIT)); then
+            process_budget_reached=true
+            proc_limit=true
+            break
+        fi
+        process_entries=$((process_entries + 1))
+        if nginx_process "$proc"; then
+            process_role=$(nginx_process_role "$proc")
+            processes+=("$proc")
+            if [[ $process_role == master ]]; then master_count=$((master_count + 1)); fi
+        elif [[ $? -eq 2 ]]; then
+            visibility_limited=true
+        fi
+    done <<< "$process_paths"
+    installation_paths+=("$(type -P nginx || :)" "$(type -P openresty || :)" "$(type -P tengine || :)"
+                        "$site_prefix/sbin/nginx" "$site_prefix/bin/nginx"
+                        /usr/sbin/nginx /usr/local/nginx/sbin/nginx /usr/local/openresty/nginx/sbin/nginx /usr/local/tengine/sbin/nginx)
+    nginx_read_config() {
+        row_config=$(nginx2root_config "$@") || row_config=
+        # Each distinct configuration spends from the same scan-wide budget.
+        if [[ $row_config =~ \"directory_entries_examined\":([0-9]+),\"glob_expansions\":([0-9]+),\"glob_budget_reached\":(true|false) ]]; then
+            config_directory_remaining=$((config_directory_remaining - BASH_REMATCH[1]))
+            config_glob_remaining=$((config_glob_remaining - BASH_REMATCH[2]))
+            if [[ ${BASH_REMATCH[3]} == true ]]; then config_glob_budget_reached=true; fi
+        fi
+    }
+
+    nginx_read_config ${config_paths[@]+"${config_paths[@]}"}
+    config_report=$row_config
+    sctp_report=$(nginx2root_sctp)
+
+    nginx_config_view_matches() {
+        local source=$1 started=$2 root_id=$3 mount_ns=$4
+        [[ $(java_process_start "${source##*/}") == "$started" &&
+           $(file_id "$source/root") == "$root_id" &&
+           ( -z $mount_ns || $(readlink "$source/ns/mnt" 2>/dev/null) == "$mount_ns" ) ]]
+    }
+
+    nginx_read_entry_config() {
+        local entry=$1 source=${2:-} started=${3:-} root_id=${4:-} mount_ns=${5:-}
+        local scope=host config_index
+        row_config=
+        if [[ -n $source ]]; then
+            # Container workers share the verified config owner's filesystem view.
+            nginx_config_view_matches "$source" "$started" "$root_id" "$mount_ns" || return 0
+            scope="$source:$started:$root_id:$mount_ns"
+        fi
+        for ((config_index=0; config_index<config_count; config_index++)); do
+            if [[ ${config_scopes[config_index]} == "$scope" && ${config_entries[config_index]} == "$entry" ]]; then
+                row_config=${config_values[config_index]}
+                return 0
+            fi
+        done
+        if [[ -n $source ]]; then
+            nginx_read_config --root "$source/root" "$entry"
+            nginx_config_view_matches "$source" "$started" "$root_id" "$mount_ns" || row_config=
+        else
+            nginx_read_config "$entry"
+        fi
+        [[ -n $row_config ]] || return 0
+        config_scopes[config_count]=$scope
+        config_entries[config_count]=$entry
+        config_values[config_count]=$row_config
+        config_count=$((config_count + 1))
+    }
 
     nginx2root_row() {
-        local kind=$1 pid=$2 path=$3 raw=$4 matched=$5 package_hint=${6:-null} image_state=$7
-        local references missing_count plus_unresolved=false
-        # Only use published core mappings for exact derivative release identifiers.
+        local kind=$1 pid=$2 path=$3 raw=$4 package_hint=${5:-null} image_state=$6 path_source=${7:-} version_source=${8:-}
+        local cves missing_count missing_potential missing_unknown missing_config skipped_config row_result=no_risk
         if [ -z "$raw" ]; then
+            # OpenResty 官方四段版本号的前三段是所捆绑的 Nginx 内核版本。
             case $flavor:$product_version in
-                openresty:1.31.8.1) raw=1.31.8 ;;
-                openresty:1.25.3.1) raw=1.25.3 ;;
-                openresty:1.27.1.2) raw=1.27.1 ;;
+                openresty:*)
+                    [[ $product_version =~ ^[0-9]+(\.[0-9]+){3}$ ]] && raw=${product_version%.*} ;;
                 tengine:3.2.0-rc5) raw=1.31.5 ;;
             esac
         fi
@@ -2623,10 +2949,10 @@ nginx2root_scan() {
                 unmapped+="${unmapped:+,}$(jstr "$tag")"
             fi
         fi
-        references=$(nginx2root_reference "$raw" "${row_config:-}" "$flavor" "$plus")
-        [[ $flavor != plus || -n $plus ]] || plus_unresolved=true
-        local missing_potential missing_unknown
-        local missing_config skipped_config
+        cves=$(nginx2root_cves "$raw" "${row_config:-}" "$flavor" "$plus" "$version_source")
+        if [[ $row_config =~ \"skipped\":[1-9] || $cves == *'"result_reason":"configuration_not_attributed"'* ]]; then
+            config_blocking=true
+        fi
         read -r missing_count missing_potential missing_unknown missing_config skipped_config < <(
             awk -F '}' '{
                 for (i=1; i<=NF; i++) {
@@ -2634,94 +2960,208 @@ nginx2root_scan() {
                     if ($i ~ /"config_evidence":"configuration_incomplete"/) skipped++
                     if ($i !~ /"config_evidence":"condition_not_observed"/) continue
                     total++
-                    if ($i ~ /"status":"potential"/) potential++
-                    if ($i ~ /"status":"unknown"/) unknown++
+                    if ($i ~ /"version_range_match":true/) potential++
+                    else if ($i ~ /"version_range_match":null/) unknown++
                 }
-            } END {print total+0, potential+0, unknown+0, unattributed+0, skipped+0}' <<< "$references"
+            } END {print total+0, potential+0, unknown+0, unattributed+0, skipped+0}' <<< "$cves"
         )
         condition_not_observed=$((condition_not_observed + missing_count))
         potential_missing=$((potential_missing + missing_potential))
         unknown_missing=$((unknown_missing + missing_unknown))
         unattributed=$((unattributed + missing_config))
         incomplete_config=$((incomplete_config + skipped_config))
-        case $references in *'"status":"potential"'*) gate=1 ;; esac
-        case $references in *'"status":"unknown"'*) unknown=1 ;; esac
+        case $cves in *'"result":"pending"'*) row_result=pending; unknown=1 ;; esac
+        case $cves in *'"result":"risk"'*) row_result=risk; gate=1 ;; esac
+        case $cves in *'"version_range_match":null'*) version_unknown=true ;; esac
         total=$((total + 1))
-        if [ "$format" = json ]; then
-            printf '%s{"kind":"%s","pid":%s,"path":%s,"version":%s,"disk_identity_matched":%s,"disk_identity_status":"%s","flavor":"%s","plus_release":%s,"plus_release_unresolved":%s,"product_version":%s,"embedded_nginx_version":%s,"patch_status":"unverified","cves":' \
-                "$comma" "$kind" "$(jstr "$pid")" "$(jstr "$(san_field "$path")")" "$(jstr "$raw")" "$matched" "$image_state" "$flavor" "$(jstr "$plus")" "$plus_unresolved" "$(jstr "$product_version")" "$(jstr "$raw")"
-            printf '%s,"package_evidence":%s,"binary_module_hints":%s' "$references" "$package_hint" "${module_hints:-null}"
-            if [ -n "$row_config" ]; then printf ',"configuration_entry":%s,"configuration_entry_source":%s,"configuration":%s' "$(jstr "$config_entry")" "$(jstr "$config_source")" "$row_config"; fi
+        findings+=$(
+            printf '%s{"kind":"%s","pid":%s,"path":%s,"version":%s,"disk_identity_status":"%s","flavor":"%s","product_version":%s' \
+                "$comma" "$kind" "$(jstr "$pid")" "$(jstr "$(san_field "$path")")" "$(jstr "$raw")" "$image_state" "$flavor" "$(jstr "$product_version")"
+            if [[ $kind == process ]]; then printf ',"process_role":"%s"' "$process_role"; fi
+            if [[ -n $path_source ]]; then printf ',"path_source":%s' "$(jstr "$path_source")"; fi
+            if [[ -n $version_source ]]; then printf ',"version_source":%s' "$(jstr "$version_source")"; fi
+            if [[ $flavor == plus ]]; then printf ',"plus_release":%s' "$(jstr "$plus")"; fi
+            printf ',"cves":%s,"package_evidence":%s,"binary_module_hints":%s,"result":"%s"' \
+                "$cves" "$package_hint" "${module_hints:-null}" "$row_result"
+            if [[ -n $row_config ]]; then
+                printf ',"configuration_entry":%s,"configuration_entry_source":%s' "$(jstr "$config_entry")" "$(jstr "$config_source")"
+                if [[ $kind == process && -n $config_parent_pid ]]; then
+                    printf ',"configuration_parent_pid":%s' "$config_parent_pid"
+                fi
+                if [[ $config_source == container_* || $row_config != "$config_report" ]]; then
+                    printf ',"configuration":%s' "$row_config"
+                fi
+            fi
             printf '}'
-            comma=,
-        else
-            printf '%s %s %q · %s %s · NGINX 内核 %s · 磁盘身份 %s\n' "$kind" "$pid" "$path" "${flavor:-未知}" "${product_version:-}" "${raw:-未知}" "$image_state"
-            if [[ $flavor == plus ]]; then printf 'NGINX Plus 发行标识 · %s\n' "${plus:-未解析}"; fi
-            printf '%s\n' "$references"
-            if [ -n "$row_config" ]; then printf '配置来源 · %s · %q · %s\n' "$config_source" "$config_entry" "$row_config"; fi
-            if [[ -n $module_hints && $module_hints != '[]' ]]; then printf '二进制模块线索 · %s\n' "$module_hints"; fi
-            [ "$package_hint" = null ] || printf '软件包线索: %s\n' "$package_hint"
-        fi
+        )
+        comma=,
     }
 
     self_ns=$(readlink /proc/self/ns/mnt 2>/dev/null || :)
     self_root=$(file_id /proc/self/root || :)
-    for proc in /proc/[0-9]*; do
-        [ -r "$proc/comm" ] || continue
-        IFS= read -r current < "$proc/comm" 2>/dev/null || continue
-        case $current in nginx|openresty|tengine) ;; *) continue ;; esac
-        ((rows < 24)) || { proc_limit=true; break; }
+    for proc in ${processes[@]+"${processes[@]}"}; do
+        if ! nginx_process "$proc"; then
+            unresolved=$((unresolved + 1))
+            unknown=1
+            continue
+        fi
         pid=${proc##*/}
         start=$(java_process_start "$pid")
+        process_role=$(nginx_process_role "$proc")
         path=$(readlink "$proc/exe" 2>/dev/null || :)
         id=$(file_id "$proc/exe" || :)
-        metadata=$(nginx2root_binary_metadata "$proc/exe")
-        IFS='|' read -r raw flavor plus module_hints product_version <<< "$metadata"
+        metadata=
+        for ((image_index=0; image_index<image_count; image_index++)); do
+            [[ ${image_ids[image_index]} != "$id" ]] || break
+        done
+        if ((image_index < image_count)); then
+            metadata=${image_metadata[image_index]}
+        elif [[ -n $id && -n $start ]]; then
+            metadata=$(nginx2root_binary_metadata "$proc/exe")
+        fi
+        IFS='|' read -r raw flavor plus module_hints product_version compiled_config <<< "$metadata"
         image_state=$(web_disk_identity "$proc" "$path" "$id")
         process_ns=$(readlink "$proc/ns/mnt" 2>/dev/null || :)
+        process_root=$(file_id "$proc/root" || :)
         if [[ -z $id || -z $start || $(file_id "$proc/exe") != "$id" ||
               $(java_process_start "$pid") != "$start" ]]; then
-            raw= flavor= plus= module_hints= product_version=
+            raw= flavor= plus= module_hints= product_version= compiled_config=
             image_state=unverified
-        elif [[ $image_state == matched ]]; then
+        else
             seen+="$id "
+            if ((image_index == image_count)); then
+                image_ids[image_index]=$id
+                image_metadata[image_index]=$metadata
+                image_count=$((image_count + 1))
+            fi
         fi
-        matched=$(web_identity_boolean "$image_state")
         [[ $image_state == matched ]] || unresolved=$((unresolved + 1))
+        possible_host=true
+        if [[ ( -n $self_ns && -n $process_ns && $process_ns != "$self_ns" ) ||
+              ( -n $self_root && -n $process_root && $process_root != "$self_root" ) ]]; then
+            possible_host=false
+        fi
+        path_source= version_source= package_id= hint_source=
+        if [[ $process_role == master && $possible_host == true && -z $path && -z $id && -n $start ]] &&
+                title_path=$(nginx_master_binary_hint "$proc"); then
+            if [[ $title_path == /* ]]; then
+                hint_source=process_title
+            elif [[ $master_count -eq 1 && -r $proc/cgroup && -z $(container_hint "$proc") ]] &&
+                    { [[ -n ${config_paths[0]:-} ]] || nginx_process_uses_default_config "$proc" ||
+                      [[ -n $(nginx_process_config_entry "$proc") ]]; } &&
+                    title_path=$(nginx_unique_local_binary "$title_path" "${installation_paths[@]}"); then
+                hint_source=unique_local_installation
+            fi
+        fi
+        if [[ -n $hint_source ]] && disk_id=$(file_id "$title_path") &&
+                [[ $(java_process_start "$pid") == "$start" ]]; then
+            metadata=$(nginx2root_binary_metadata "$title_path")
+            if [[ $(file_id "$title_path") == "$disk_id" && $(java_process_start "$pid") == "$start" ]]; then
+                path=$title_path
+                path_source=$hint_source
+                if [[ -n $metadata ]]; then
+                    IFS='|' read -r raw flavor plus module_hints product_version compiled_config <<< "$metadata"
+                    version_source=disk
+                    package_id=$disk_id
+                fi
+                seen+="$disk_id "
+            fi
+        fi
+
         package_hint=null
-        config_entry= row_config= config_source=
-        if [ -n "${config_paths[0]:-}" ]; then row_config=$config_report; config_source=explicit; config_entry=${config_paths[0]}; fi
-        if [[ $matched == true && -n $self_ns && $process_ns == "$self_ns" &&
-              -n $self_root && $(file_id "$proc/root") == "$self_root" && $(file_id "$path") == "$id" ]]; then
-            if [ -z "${config_paths[0]:-}" ]; then
-                config_entry=$(nginx_process_config_entry "$proc")
-                if [[ -n $config_entry && $(java_process_start "$pid") == "$start" ]]; then
-                    config_source=process_argument
-                    row_config=$(nginx2root_config "$config_entry")
-                    if web_coverage_incomplete false 0 "$row_config"; then unknown=1; fi
+        config_entry= row_config= config_source= config_parent_pid=
+        same_host=false
+        if [[ $image_state == matched && -n $self_ns && $process_ns == "$self_ns" &&
+               -n $self_root && $process_root == "$self_root" && $(file_id "$path") == "$id" ]]; then
+            same_host=true
+            package_id=$id
+        fi
+        config_proc=$proc
+        case $process_role in
+            worker|auxiliary)
+                config_proc=$(nginx_worker_parent "$proc" "$id" "$process_root" "$process_ns") || config_proc= ;;
+            unknown) config_proc= ;;
+        esac
+        config_start=$start
+        if [[ -n $config_proc && $config_proc != "$proc" ]]; then
+            config_start=$(java_process_start "${config_proc##*/}")
+        fi
+        if [[ -n ${config_paths[0]:-} ]]; then
+            row_config=$config_report
+            config_source=explicit
+            config_entry=${config_paths[0]}
+        elif [[ -n $config_proc && -n $config_start && -n $start && $possible_host == false && -n $process_root ]]; then
+            config_entry=$(nginx_process_config_entry "$config_proc")
+            if [[ -n $config_entry ]]; then
+                config_source=container_process_argument
+            elif nginx_process_uses_default_config "$config_proc"; then
+                config_source=container_default
+                config_entry=$compiled_config
+                if [[ -z $config_entry ]]; then
+                    case $path in
+                        /usr/sbin/nginx|/usr/bin/nginx) config_entry=/etc/nginx/nginx.conf ;;
+                        /*/sbin/*|/*/bin/*) config_entry=${path%/*/*}/conf/nginx.conf ;;
+                    esac
                 fi
             fi
+            if [[ $config_entry == /* && $(java_process_start "$pid") == "$start" ]]; then
+                nginx_read_entry_config "$config_entry" "$config_proc" "$config_start" "$process_root" "$process_ns"
+                if [[ $(java_process_start "$pid") != "$start" || $(file_id "$proc/root") != "$process_root" ||
+                      ( -n $process_ns && $(readlink "$proc/ns/mnt" 2>/dev/null) != "$process_ns" ) ||
+                      ( -n $id && $(file_id "$proc/exe") != "$id" ) ]]; then
+                    row_config=
+                fi
+            fi
+        elif [[ -n $config_proc && -n $config_start && -n $start && $possible_host == true &&
+                ( $same_host == true || $image_state == unverified ) ]]; then
+            config_entry=$(nginx_process_config_entry "$config_proc")
+            if [[ -n $config_entry ]]; then
+                config_source=process_argument
+            elif [[ $same_host == true || -n $path_source ]] &&
+                    config_entry=$(nginx_site_config_entry "$config_proc" "$path" "$flavor"); then
+                config_source=installation_layout
+            elif [[ $same_host == true || $path_source == unique_local_installation ]] &&
+                    nginx_process_uses_default_config "$config_proc"; then
+                if [[ $compiled_config == /* ]]; then
+                    config_entry=$compiled_config
+                elif [[ -z $compiled_config ]]; then
+                    config_entry=$(nginx_layout_config "$path" "$flavor")
+                fi
+                config_source=installation_layout
+            fi
+            if [[ -n $config_entry && $(java_process_start "$pid") == "$start" ]]; then
+                [[ $same_host == true ]] || config_source+=_unverified
+                nginx_read_entry_config "$config_entry"
+            fi
+        fi
+        if [[ -n $row_config && $config_source != explicit && $config_proc != "$proc" ]]; then
+            if [[ $(java_process_start "${config_proc##*/}") == "$config_start" &&
+                  $(java_process_start "$pid") == "$start" && $(file_id "$proc/exe") == "$id" &&
+                  $(nginx_worker_parent "$proc" "$id" "$process_root" "$process_ns") == "$config_proc" ]]; then
+                config_parent_pid=${config_proc##*/}
+            else
+                row_config=
+            fi
+        fi
+        if [[ -n $package_id ]]; then
             for ((index=0; index<package_count; index++)); do
-                [ "${package_ids[index]}" != "$id" ] || break
+                [ "${package_ids[index]}" != "$package_id" ] || break
             done
             if [ "$index" -eq "$package_count" ]; then
-                package_ids[index]=$id
+                package_ids[index]=$package_id
                 package_values[index]=$(web_package_hint "$path")
                 package_count=$((package_count + 1))
             fi
             package_hint=${package_values[index]:-null}
         fi
-        nginx2root_row process "$pid" "$path" "$raw" "$matched" "$package_hint" "$image_state"
-        rows=$((rows + 1))
+        nginx2root_row process "$pid" "$path" "$raw" "$package_hint" "$image_state" "$path_source" "$version_source"
     done
-    installed=$(type -P nginx || :)
-    for path in "$explicit" "$installed" "$(type -P openresty || :)" "$(type -P tengine || :)" \
-                /usr/sbin/nginx /usr/local/nginx/sbin/nginx /usr/local/openresty/nginx/sbin/nginx /usr/local/tengine/sbin/nginx; do
+    for path in "${installation_paths[@]}"; do
         [ -n "$path" ] && [ -f "$path" ] || continue
         id=$(file_id "$path") || continue
         [[ $seen != *" $id "* ]] || continue
         metadata=$(nginx2root_binary_metadata "$path")
-        IFS='|' read -r raw flavor plus module_hints product_version <<< "$metadata"
+        IFS='|' read -r raw flavor plus module_hints product_version compiled_config <<< "$metadata"
         seen+="$id "
         package_hint=$(web_package_hint "$path")
         config_entry= row_config= config_source=
@@ -2732,179 +3172,240 @@ nginx2root_scan() {
         elif config_entry=$(nginx_layout_config "$path" "$flavor") && [ -n "$config_entry" ]; then
             config_source=installation_layout
             if [[ $path == /usr/sbin/nginx && $config_entry == /etc/nginx/nginx.conf ]]; then config_source=system_layout; fi
-            row_config=$(nginx2root_config "$config_entry")
-            if web_coverage_incomplete false 0 "$row_config"; then unknown=1; fi
+            nginx_read_entry_config "$config_entry"
         fi
-        nginx2root_row installation "" "$path" "$raw" null "${package_hint:-null}" not_applicable
+        nginx2root_row installation "" "$path" "$raw" "${package_hint:-null}" not_applicable
     done
-    if [ "$gate" -eq 1 ]; then gate_hit=true; fi
-    if (( unattributed > 0 || incomplete_config > 0 )); then config_incomplete=true; fi
-    if [ "$unknown" -eq 1 ] || [ "$total" -eq 0 ] || web_coverage_incomplete "$proc_limit" "$unresolved" "$config_report"; then incomplete=true; fi
-    if [ "$format" = json ]; then
-        printf '],"coverage":{"proc_limit_reached":%s,"incomplete_process_evidence":%d,"evidence_incomplete":%s,"configuration_evidence_incomplete":%s,"configuration_incomplete":%s},"summary":{"risk_gate_hit":%s,"condition_not_observed":%d,"potential_condition_not_observed":%d,"unknown_condition_not_observed":%d,"configuration_not_attributed":%d,"configuration_incomplete":%d,"unmapped_product_versions":[%s]}}\n' "$proc_limit" "$unresolved" "$incomplete" "$config_incomplete" "$config_incomplete" "$gate_hit" "$condition_not_observed" "$potential_missing" "$unknown_missing" "$unattributed" "$incomplete_config" "$unmapped"
-    else
-        printf '进程覆盖 · 达到上限 %s · 证据不完整 %s\n' "$proc_limit" "$unresolved"
-        printf '版本门禁命中 %s · 证据不完整 %s\n' "$gate_hit" "$incomplete"
-        if [ -n "$unmapped" ]; then printf '未解析内核的衍生版本 · [%s]\n' "$unmapped"; fi
-        printf '配置未归属 · %d 项（按发现行和 CVE 计）\n' "$unattributed"
-        printf '配置读取不完整 · %d 项（按发现行和 CVE 计）\n' "$incomplete_config"
-        printf '缺少必要磁盘线索 · %d 项（版本命中 %d · 版本未知 %d，按发现行和 CVE 计）\n' "$condition_not_observed" "$potential_missing" "$unknown_missing"
+    if ((total == 0)) && [[ $config_report =~ \"(files_examined|skipped)\":[1-9] ]]; then
+        # Keep a finding for a discovered configuration, even if it was unreadable.
+        flavor= plus= product_version= module_hints=
+        row_config=$config_report
+        config_entry=${config_paths[0]:-}
+        config_source=host_scan
+        [[ -z $config_entry ]] || config_source=explicit
+        nginx2root_row configuration "" "$config_entry" "" null not_applicable
     fi
-    if [ "$gate" -eq 1 ]; then return 1; fi
-    if [ "$incomplete" = true ]; then return 3; fi
-    return 0
+    if ((incomplete_config > 0)) || [[ $config_report =~ \"skipped\":[1-9] || $config_glob_budget_reached == true ]]; then
+        config_blocking=true
+    fi
+    if ((unattributed > 0)) || [[ $config_blocking == true ]]; then
+        config_incomplete=true
+    fi
+    local result=no_risk result_reason=risk_gate_not_hit exit_code coverage_reason
+    if process_visibility_limited; then visibility_limited=true; fi
+    if [[ $config_glob_budget_reached == true ]]; then
+        coverage_reason=scan_budget_exhausted
+    else
+        coverage_reason=$(web_coverage_reason "$proc_limit" "$process_budget_reached" "$process_scan_unavailable" "$visibility_limited" "$unresolved" "$config_blocking")
+    fi
+    if [[ -z $coverage_reason && $unknown -eq 1 ]]; then
+        coverage_reason=finding_evidence_incomplete
+        if [[ $version_unknown == true ]]; then coverage_reason=version_match_unknown; fi
+    fi
+    if [[ -n $coverage_reason || $config_incomplete == true ]]; then incomplete=true; fi
+    if ((gate == 1)); then
+        result=risk
+        result_reason=risk_gate_hit
+    elif [[ -n $coverage_reason ]]; then
+        result=pending
+        result_reason=$coverage_reason
+    elif ((total == 0)); then
+        result_reason=no_nginx_findings
+    elif ((unattributed > 0)); then
+        result_reason=version_outside_range
+    fi
+    exit_code=$(scan_exit_code "$result")
+    printf '{"result":"%s","result_reason":"%s","exit_code":%s,"category":"Nginx2Root"' "$result" "$result_reason" "$exit_code"
+    printf ',"assessment_scope":"version_and_disk_configuration","patch_verified":false,"sctp":%s,"configuration_scope":"host","configuration":%s,"findings":[%s],' \
+        "$sctp_report" "$config_report" "$findings"
+    printf '"coverage":{"proc_limit_reached":%s,"incomplete_process_evidence":%d,"evidence_incomplete":%s,"configuration_incomplete":%s,"process_visibility_limited":%s,"process_scan_limit":%s,"process_entries_examined":%s,"process_budget_reached":%s,"process_scan_unavailable":%s,' \
+        "$proc_limit" "$unresolved" "$incomplete" "$config_incomplete" "$visibility_limited" "$PROCESS_SCAN_LIMIT" "$process_entries" "$process_budget_reached" "$process_scan_unavailable"
+    printf '"config_directory_entry_limit":%s,"config_directory_entries_examined":%s,"config_glob_expansion_limit":%s,"config_glob_expansions":%s,"config_glob_budget_reached":%s},' \
+        "$NGINX_CONFIG_DIRECTORY_LIMIT" "$((NGINX_CONFIG_DIRECTORY_LIMIT - config_directory_remaining))" \
+        "$NGINX_CONFIG_GLOB_LIMIT" "$((NGINX_CONFIG_GLOB_LIMIT - config_glob_remaining))" "$config_glob_budget_reached"
+    printf '"summary":{"condition_not_observed":%d,"potential_condition_not_observed":%d,"unknown_condition_not_observed":%d,"configuration_not_attributed":%d,"configuration_incomplete":%d,"unmapped_product_versions":[%s]}}\n' \
+        "$condition_not_observed" "$potential_missing" "$unknown_missing" "$unattributed" "$incomplete_config" "$unmapped" || return 2
+    return "$exit_code"
 }
 
 java4shell_main() {
     parse_args "$@"
 
-    WORK=$(mktemp -d "${TMPDIR:-/tmp}/java4shell.XXXXXX") || die "无法创建临时目录"
+    WORK=$(mktemp -d "${TMPDIR:-/tmp}/java4shell.XXXXXX") || die "Cannot create the Java scan temporary directory."
     FIND_FILE="$WORK/findings.tsv"
     WARN_FILE="$WORK/warnings.txt"
-    APP_FILE="$WORK/apps.tsv"
     ACTIVE_FILE="$WORK/active-ids"
     ROOT_COVERAGE_FILE="$WORK/root-coverage"
-    : > "$ROOT_COVERAGE_FILE"
-    : > "$FIND_FILE"; : > "$WARN_FILE"; : > "$APP_FILE"; : > "$ACTIVE_FILE"
     trap 'cleanup' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    local scratch_file
+    for scratch_file in "$ROOT_COVERAGE_FILE" "$FIND_FILE" "$WARN_FILE" "$ACTIVE_FILE"; do
+        : > "$scratch_file" || die "Cannot initialize the temporary report."
+    done
+    printf '0\n' > "$WORK/map-bytes" || die "Cannot initialize the process map byte count."
 
     if [ "$PROC_ONLY" -eq 1 ]; then MODE_NAME="processes-only"; else MODE_NAME="local"; fi
 
-    # 输出格式推断
-    if [ -z "$FORMAT" ]; then
-        case ${OUT##*.} in
-            json) FORMAT=json ;;
-            csv)  FORMAT=csv ;;
-            *)    FORMAT=txt ;;
-        esac
-    fi
-
-    if [ "$DEMO" -eq 1 ]; then
-        MODE_NAME=demo
-        CPU_SOURCE="demo fixtures"
-        if [ -n "$OUT" ]; then
-            [ ! -e "$OUT" ] && [ ! -L "$OUT" ] || die "输出文件已存在: $OUT"
-            local demo_rc=0
-            (set -C; exec > "$OUT" || exit 2; run_demo) || demo_rc=$?
-            [ "$demo_rc" -ne 2 ] || die "写入报告失败: $OUT"
-            exit "$demo_rc"
-        fi
-        run_demo
-        exit $?
-    fi
-
-    if [ -n "$OUT" ] && [ -e "$OUT" ]; then
-        die "输出文件已存在，本工具不覆盖: $OUT"
-    fi
-
-    if [ ${#JDK_ARGS[@]} -gt 0 ]; then
-        local d
-        for d in ${JDK_ARGS[@]+"${JDK_ARGS[@]}"}; do
-            [ -d "$d" ] || die "--jdk 不是目录: $d"
-        done
-    fi
     if [ ${#ROOT_ARGS[@]} -gt 0 ] && [ "$PROC_ONLY" -eq 0 ]; then
         local r
         for r in ${ROOT_ARGS[@]+"${ROOT_ARGS[@]}"}; do
-            [ -d "$r" ] || die "--root 不是目录: $r"
+            [ -d "$r" ] || die "--root requires an existing directory."
         done
     fi
 
     cpu_probe
-    note_progress "CPU 条件: ${CPU_STATE}（${CPU_SOURCE}）"
 
     if [ "$EUID" -ne 0 ] 2>/dev/null; then
-        warn "当前非 root 运行：部分其他用户的进程 /proc 可能不可读，进程发现可能不完整。"
+        warn "The scan runs without root privileges. Limited /proc access can prevent discovery of processes that other users own."
     fi
 
     case $OS in
         Linux) : ;;
         Darwin) : ;;
-        *) warn "当前平台 ($OS) 无 /proc，进程级校验降级为启动器线索。" ;;
+        *) warn "The platform ($OS) has no /proc. The scan uses launcher hints for process checks." ;;
     esac
 
     # --- 运行进程 ---
     if [ "$NO_PROC" -eq 0 ]; then
-        if [ "$OS" = "Linux" ]; then
-            note_progress "检查运行中的 JVM 进程..."
+        if [[ $OS == Linux && -r /proc/self/stat ]]; then
             scan_processes
         elif [ "$OS" = "Darwin" ]; then
-            note_progress "检查 Java 进程（启动器线索）..."
             scan_processes_other
         else
-            warn "当前平台不支持进程发现。"
+            JAVA_PROC_SCAN_UNAVAILABLE=true
+            warn "The scan cannot discover processes on this platform."
         fi
     fi
 
     # --- 安装目录 ---
     if [ "$PROC_ONLY" -eq 0 ]; then
-        note_progress "盘点 JDK 安装目录..."
         scan_installations
     fi
 
-    # --- java -version 门禁 ---
-    if [ ${#JAVA_BINS[@]} -gt 0 ]; then
-        local b
-        for b in ${JAVA_BINS[@]+"${JAVA_BINS[@]}"}; do
-            scan_java_binary "$b"
-        done
+    local coverage_counts
+    coverage_counts=$(awk '
+        { counts[$0]++ }
+        END { printf "%d %d\n", counts["boundary"], counts["error"] }
+    ' "$ROOT_COVERAGE_FILE") || die "Cannot read the directory scan coverage record."
+    read -r ROOT_DEPTH_BOUNDARIES ROOT_SCAN_ERRORS <<< "$coverage_counts" ||
+        die "Cannot parse the directory scan coverage record."
+    IFS= read -r JAVA_MAP_BYTES_READ < "$WORK/map-bytes" || die "Cannot read the process map byte count."
+    if [[ -f $WORK/map-total-limit ]] || grep -qx map_limit "$ROOT_COVERAGE_FILE"; then
+        JAVA_MAP_BUDGET_REACHED=true
     fi
-
-    # --- 应用清点 ---
-    if [ -n "$APPS_DIR" ]; then
-        note_progress "清点已知受影响应用: $APPS_DIR"
-        scan_apps "$APPS_DIR" "$APPS_DEPTH"
-    fi
-
-    ROOT_DEPTH_BOUNDARIES=$(grep -cx boundary "$ROOT_COVERAGE_FILE")
-    ROOT_SCAN_ERRORS=$(grep -cx error "$ROOT_COVERAGE_FILE")
+    if grep -qx root_limit "$ROOT_COVERAGE_FILE"; then JAVA_ROOT_BUDGET_REACHED=true; fi
     if [ "$ROOT_DEPTH_BOUNDARIES" -gt 0 ]; then
-        warn "有 $ROOT_DEPTH_BOUNDARIES 个目录达到 --root-depth $ROOT_DEPTH，更深的目录未检查。"
+        warn "$ROOT_DEPTH_BOUNDARIES directories reached --root-depth $ROOT_DEPTH. The scan skipped deeper directories."
+    fi
+    if ((LIMITED_PROCS > 0)); then
+        warn "Cannot read the maps of $LIMITED_PROCS processes. This can hide embedded JVMs."
     fi
 
-    if [ "${LIMITED_PROCS:-0}" -gt 0 ]; then
-        warn "有 $LIMITED_PROCS 个进程的映射无法读取，进程发现可能不完整。"
+    if ((NO_PROC == 0 && ${#PID_ARGS[@]} == 0)) &&
+       process_visibility_limited; then
+        JAVA_PROC_VISIBILITY_LIMITED=true
     fi
 
-    if [ "$(total_count)" -eq 0 ] && [ "$(apps_count)" -eq 0 ]; then
-        warn "在本次检查范围内没有找到可评估的 Java 资产。"
+    if [ "$(total_count)" -eq 0 ]; then
+        warn "The scan found no Java assets to assess in its scope."
     fi
 
-    # --- 输出 ---
-    report_all() {
-        case $FORMAT in
-            json) report_json ;;
-            csv)  report_csv; report_apps_csv ;;
-            *)    report_txt ;;
+    report_json
+}
+
+# 帮助使用与巡检报告相同的 JSON 格式。
+usage() {
+    printf '{"result":"pending","event":"help","program":%s,"version":%s,"usage":["--all","--java4shell [OPTIONS]","--nginx2root [--nginx-path PATH] [--nginx-config FILE]","--apache2root [--apache-path PATH] [--apache-config FILE]"],"output":"English JSON only","results":["risk","no_risk","pending"],' "$(jstr "$PROG")" "$(jstr "$SCRIPT_VERSION")"
+    printf '"java_options":["--root DIR","--root-depth N","--pid PID","--processes-only","--no-processes","--jcmd","--json"],'
+    printf '"scan_timeout_seconds":%s,' "$SCAN_TIMEOUT_SECONDS"
+    printf '"exit_codes":{"0":"No risk gate matched in the checked scope.","1":"A risk gate matched, even if coverage is incomplete.","2":"Invalid arguments or execution failure.","3":"No risk gate matched and the evidence is insufficient."},'
+    printf '"process_visibility_hint":"If host processes are not visible, rerun from an environment that can see them."}\n'
+}
+
+# 将内部检测状态映射为 JSON 结果。
+output_result() {
+    case ${1:-unknown} in
+        affected|potential|1) printf risk ;;
+        mitigated|not_affected|outside_scope|outside_upstream_range|meets_upstream_reference|0) printf no_risk ;;
+        *) printf pending ;;
+    esac
+}
+
+# Java 巡检报告
+report_json() {
+    local id kind status reason build bevid cpu version jhome vendor product vm arch flags feff container notes identity disk_version disk_vendor disk_product disk_build
+    local affected potential mitigated safe unknown total result finding_result exit_code first=1
+    local result_reason=risk_gate_not_hit coverage_reason= incomplete=false
+    affected=$(status_count affected); potential=$(status_count potential)
+    mitigated=$(status_count mitigated); safe=$(status_count not_affected)
+    unknown=$(status_count unknown); total=$(total_count)
+    if java_budget_reached; then
+        coverage_reason=scan_budget_exhausted
+    elif [[ $JAVA_PROC_SCAN_UNAVAILABLE == true ]]; then
+        coverage_reason=process_scan_unavailable
+    elif [[ $JAVA_PROC_VISIBILITY_LIMITED == true ]]; then
+        coverage_reason=process_visibility_limited
+    elif ((LIMITED_PROCS > 0)); then
+        coverage_reason=unreadable_process_maps
+    elif ((ROOT_DEPTH_BOUNDARIES > 0 || ROOT_SCAN_ERRORS > 0)); then
+        coverage_reason=scan_coverage_incomplete
+    elif ((unknown > 0)); then
+        coverage_reason=finding_evidence_incomplete
+    fi
+    if [[ -n $coverage_reason ]]; then incomplete=true; fi
+    result=no_risk
+    if ((affected + potential > 0)); then
+        result=risk
+        result_reason=risk_gate_hit
+    elif [[ -n $coverage_reason ]]; then
+        result=pending
+        result_reason=$coverage_reason
+    elif ((total == 0)); then
+        result_reason=no_java_findings
+    elif [[ $OS == Linux && ( $ARCH_NORM == x86_64 || $ARCH_NORM == amd64 ) &&
+            $CPU_SOURCE == /proc/cpuinfo && $CPU_STATE == absent ]]; then
+        result_reason=cpu_condition_not_met
+    fi
+    exit_code=$(scan_exit_code "$result")
+    printf '{"result":"%s","result_reason":"%s","exit_code":%s,"category":"Java4Shell","cve":%s,"rules_as_of":%s,"mode":%s,' \
+        "$result" "$result_reason" "$exit_code" "$(jstr "$CVE")" "$(jstr "$RULES_AS_OF")" "$(jstr "$MODE_NAME")"
+    printf '"summary":{"total":%s,"risk":%s,"no_risk":%s,"pending":%s},' "$total" "$((affected + potential))" "$((mitigated + safe))" "$unknown"
+    printf '"cpu":{"arch":%s,"state":%s,"required_features":%s,"counts":%s},' \
+        "$(jstr "$ARCH_RAW")" "$(jstr "$CPU_STATE")" "$(jstr "$REQ_FEATURES")" "$(jstr "$CPU_COUNTS")"
+    printf '"coverage":{"evidence_incomplete":%s,"root_max_depth":%s,"root_depth_boundaries":%s,"root_scan_errors":%s,"unreadable_process_maps":%s,"process_scan_unavailable":%s,"process_visibility_limited":%s,' \
+        "$incomplete" "$((10#$ROOT_DEPTH))" "$ROOT_DEPTH_BOUNDARIES" "$ROOT_SCAN_ERRORS" "$LIMITED_PROCS" "$JAVA_PROC_SCAN_UNAVAILABLE" "$JAVA_PROC_VISIBILITY_LIMITED"
+    printf '"process_scan_limit":%s,"process_entries_examined":%s,"process_budget_reached":%s,"map_read_limit_bytes":%s,"map_total_limit_bytes":%s,"map_bytes_read":%s,"map_budget_reached":%s,' \
+        "$PROCESS_SCAN_LIMIT" "$JAVA_PROC_ENTRIES" "$JAVA_PROC_BUDGET_REACHED" "$MAP_SCAN_MAX_BYTES" "$MAP_SCAN_TOTAL_BYTES" "$JAVA_MAP_BYTES_READ" "$JAVA_MAP_BUDGET_REACHED"
+    printf '"directory_entry_limit":%s,"directory_timeout_seconds":%s,"root_budget_reached":%s}' \
+        "$DIRECTORY_SCAN_LIMIT" "$DIRECTORY_SCAN_SECONDS" "$JAVA_ROOT_BUDGET_REACHED"
+    if ((LIMITED_PROCS > 0)); then
+        printf ',"warnings":[{"code":"unreadable_process_maps","count":%s}]' "$LIMITED_PROCS"
+    fi
+    printf ',"findings":['
+    while IFS=$'\037' read -r id kind status reason build bevid cpu version jhome vendor product vm arch flags feff container notes identity disk_version disk_vendor disk_product disk_build; do
+        [ -n "$id" ] || continue
+        [ "$first" -eq 1 ] || printf ','; first=0
+        finding_result=$(output_result "$status")
+        # 为机器接口提供固定的判定说明。
+        case $status in
+            affected) reason='Risk identified by the configured build and runtime rules.' ;;
+            potential) reason='Potential risk identified; vendor or runtime verification is required.' ;;
+            mitigated) reason='Mitigation identified by the configured rules.' ;;
+            not_affected) reason='Outside the affected conditions of the configured rules.' ;;
+            *) reason='Insufficient evidence to determine risk.' ;;
         esac
-    }
-
-    if [ -n "$OUT" ]; then
-        (set -C; report_all > "$OUT") || die "写入报告失败: $OUT"
-        printf '报告已写入: %s\n' "$OUT" >&2
-    else
-        report_all
-    fi
-
-    # --- 退出码 ---
-    local rc=0 s c oldifs
-    oldifs=$IFS
-    IFS=','
-    for s in $FAIL_ON; do
-        s=$(trim "$s")
-        [ -n "$s" ] || continue
-        c=$(status_count "$s")
-        [ "${c:-0}" -gt 0 ] && rc=1
-    done
-    IFS=$oldifs
-    if [ "$rc" -eq 0 ] && { [ "$(status_count unknown)" -gt 0 ] ||
-                           [ "$(total_count)" -eq 0 ] || [ "$LIMITED_PROCS" -gt 0 ] ||
-                           [ "$ROOT_DEPTH_BOUNDARIES" -gt 0 ] || [ "$ROOT_SCAN_ERRORS" -gt 0 ]; }; then
-        rc=3
-    fi
-    exit "$rc"
+        printf '{"id":%s,"kind":%s,"result":"%s","reason":%s,"build_assessment":%s,"cpu_assessment":%s,' \
+            "$(jstr "$id")" "$(jstr "$kind")" "$finding_result" "$(jstr "$reason")" "$(jstr "$build")" "$(jstr "$cpu")"
+        printf '"version":%s,"java_home":%s,"vendor":%s,"product":%s,"vm":%s,"arch":%s,"flags":%s,"flags_effective":%s' \
+            "$(jstr "$version")" "$(jstr "$jhome")" "$(jstr "$vendor")" "$(jstr "$product")" "$(jstr "$vm")" "$(jstr "$arch")" "$(jstr "$flags")" "${feff:-false}"
+        [ -z "$identity" ] || printf ',"identity_confidence":%s' "$(jstr "$identity")"
+        [ -z "$disk_build" ] || printf ',"disk_evidence":{"version":%s,"vendor":%s,"product":%s,"build_assessment":%s}' \
+            "$(jstr "$disk_version")" "$(jstr "$disk_vendor")" "$(jstr "$disk_product")" "$(jstr "$disk_build")"
+        printf '}'
+    done < "$FIND_FILE"
+    printf ']}\n' || return 2
+    return "$exit_code"
 }
 
 main() {
@@ -2918,6 +3419,74 @@ main() {
     esac
 }
 
+stop_supervised_scan() {
+    local scan_pid=$1 signal=$2 scan_started=$3 exit_code=143
+    # The launcher checks for a signal received before the background PID was assigned.
+    [[ -n $scan_pid ]] || return 0
+    trap '' INT TERM
+    if [[ $signal == INT ]]; then exit_code=130; fi
+    {
+        if kill -s "$signal" -- "-$scan_pid" &&
+                ((SECONDS - scan_started < SCAN_TIMEOUT_SECONDS - 1)); then
+            sleep 1 || :
+        fi
+        kill -s KILL -- "-$scan_pid" || :
+        wait "$scan_pid" || :
+    } 2>/dev/null
+    printf '{"result":"pending","result_reason":"scan_interrupted","exit_code":%s,"error":"scan_interrupted","signal":"%s"}\n' "$exit_code" "$signal"
+    exit "$exit_code"
+}
+
+run_supervised_scan() {
+    local timer script_path=${BASH_SOURCE[0]} scan_rc=0 scan_pid= interrupt_signal= scan_started
+    local -a worker_flags=(--noprofile --norc)
+    if ! timer=$(type -P timeout || type -P gtimeout); then
+        printf '{"result":"pending","result_reason":"timeout_utility_unavailable","exit_code":2,"error":"timeout_utility_unavailable","message":"Running a scan requires timeout or gtimeout."}\n'
+        return 2
+    fi
+    [[ $script_path == /* ]] || script_path=$PWD/$script_path
+    if [[ $- == *e* ]]; then worker_flags+=(-e); fi
+    if shopt -qo pipefail; then worker_flags+=(-o pipefail); fi
+    WORK=$(mktemp -d "${TMPDIR:-/tmp}/x2shell-scan.XXXXXX") || die "Cannot create the scan temporary directory."
+    trap 'cleanup' EXIT
+    scan_started=$SECONDS
+    trap 'interrupt_signal=TERM; stop_supervised_scan "$scan_pid" "$interrupt_signal" "$scan_started"' TERM
+    trap 'interrupt_signal=INT; stop_supervised_scan "$scan_pid" "$interrupt_signal" "$scan_started"' INT
+    # Give the watchdog its own process group from launch. A background wait lets the launcher trap signals.
+    set -m
+    # Spool the worker output so a forced stop can replace it with a complete error report.
+    TMPDIR="$WORK" "$timer" -s KILL "${SCAN_TIMEOUT_SECONDS}s" \
+        "$BASH" "${worker_flags[@]}" -c '
+            source "$1" || exit 2
+            shift
+            SCAN_DEADLINE_ACTIVE=1
+            set +m
+            main "$@"
+        ' "$PROG" "$script_path" "$@" > "$WORK/report.json" 2> "$WORK/stderr.log" &
+    scan_pid=$!
+    set +m
+    if [[ -n $interrupt_signal ]]; then
+        stop_supervised_scan "$scan_pid" "$interrupt_signal" "$scan_started"
+    fi
+    wait "$scan_pid" 2>/dev/null || scan_rc=$?
+    scan_pid=
+    trap - INT TERM
+    case $scan_rc in
+        124|137)
+            printf '{"result":"pending","result_reason":"scan_timeout","exit_code":2,"error":"scan_timeout","timeout_seconds":%s}\n' "$SCAN_TIMEOUT_SECONDS"
+            return 2 ;;
+        0|1|2|3) ;;
+        *) die "The scan process failed." ;;
+    esac
+    if [[ -s $WORK/stderr.log ]]; then cat -- "$WORK/stderr.log" >&2; fi
+    [[ -s $WORK/report.json ]] || die "The scan report is unavailable."
+    cat -- "$WORK/report.json" || return 2
+    return "$scan_rc"
+}
+
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
-    main "$@"
+    case ${1:-} in
+        -h|--help|-V|--version) main "$@" ;;
+        *) run_supervised_scan "$@" ;;
+    esac
 fi
